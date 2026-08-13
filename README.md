@@ -43,10 +43,10 @@ Built incrementally. Each phase leaves the system working.
 
 | Phase | Component | Status |
 |---|---|---|
-| 0 | Environment + GPU verification | in progress |
-| 1 | Baseline PyTorch inference path | pending |
-| 2 | Tensor introspection | pending |
-| 3 | GPU memory profiling + OOM experiment | pending |
+| 0 | Environment + GPU verification | **done** |
+| 1 | Baseline PyTorch inference path | **done** |
+| 2 | Tensor introspection | **done** |
+| 3 | GPU memory profiling + OOM experiment | next |
 | 4 | Batch size benchmark | pending |
 | 5 | FP32 vs FP16 | pending |
 | 6 | ONNX export | pending |
@@ -70,15 +70,56 @@ Built incrementally. Each phase leaves the system working.
 ## Quickstart
 
 ```bash
-uv sync                    # core + PyTorch backend
-uv sync --extra onnx       # + ONNX Runtime backend
-uv sync --extra trt        # + TensorRT backend
+uv sync                                     # core + PyTorch backend
+uv run python scripts/check_gpu.py          # verify the GPU stack (exits non-zero if not)
+uv run python scripts/fetch_model.py        # provision models/resnet18/v1/
 
-uv run python scripts/check_gpu.py
+mkdir -p data && curl -sSL -o data/dog.jpg \
+  https://raw.githubusercontent.com/pytorch/hub/master/images/dog.jpg
+
+uv run python scripts/infer.py data/dog.jpg --trace --runs 50
+```
+
+Later phases add the optional backends:
+
+```bash
+uv sync --extra onnx       # ONNX Runtime
+uv sync --extra trt        # TensorRT
 ```
 
 Configuration is entirely environment-driven — see `.env.example`. No model path, device,
-batch size, or precision is hardcoded anywhere in `src/`.
+batch size, or precision is hardcoded anywhere in `src/`. CLI flags override `.env`, which
+overrides the defaults in `src/config.py`.
+
+## First results
+
+Batch 1, FP32, median of 50 warm runs. Full write-ups in [docs/experiments.md](docs/experiments.md).
+
+```
+preprocess       17.770 ms   <- CPU: JPEG decode, resize, crop, normalise
+host -> device    0.227 ms
+inference         2.982 ms   <- GPU
+device -> host    0.062 ms
+postprocess       0.109 ms
+```
+
+Three findings already worth the build:
+
+**The GPU is not the bottleneck.** Preprocessing costs ~6x the inference it feeds. Against
+a CPU-only run the GPU is 5.4x faster *at the model* but only 1.85x faster *at the request*
+— Amdahl's law, measured. This is why the queue and batch manager come before TensorRT in
+the build order: optimising the 3 ms while ignoring the 18 ms would be optimising the wrong
+thing.
+
+**`PRECISION=fp32` was not FP32.** PyTorch enables TF32 convolutions by default on Ampere,
+cutting mantissa bits from 23 to 10 while tensors still report `float32`. Measured against
+the CPU reference, the default disagreed by 3.56e-03 versus 5.25e-06 with TF32 off — 680x
+worse, silently. It is now an explicit `ALLOW_TF32` flag, defaulting to off, so the FP32
+baseline the other runtimes get compared against is genuinely FP32.
+
+**Naive GPU timing lies by ~89x.** The same matmul reports 0.065 ms without
+`torch.cuda.synchronize()` and 5.723 ms with it, because kernel launches are asynchronous.
+Every timing in this repo synchronises explicitly.
 
 ## Layout
 

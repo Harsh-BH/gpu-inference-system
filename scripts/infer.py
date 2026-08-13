@@ -156,11 +156,22 @@ def main() -> int:
     med = lambda f: statistics.median(f(r.timings) for r in results)  # noqa: E731
     inference_total = med(lambda t: t.total_ms)
 
+    # On CPU there is no PCIe hop and no SM; saying otherwise would be the kind
+    # of copied-label lie that makes a benchmark table untrustworthy.
+    gpu = settings.is_cuda
     print(f"\n\033[1mLatency\033[0m  (median of {len(results)} run(s))")
     ms("preprocess", preprocess_ms, "CPU: decode, resize, crop, normalise")
-    ms("host -> device", med(lambda t: t.h2d_ms), "batch crosses PCIe into VRAM")
-    ms("inference", med(lambda t: t.compute_ms), "CUDA kernels on the SMs")
-    ms("device -> host", med(lambda t: t.d2h_ms), "logits come back")
+    ms(
+        "host -> device",
+        med(lambda t: t.h2d_ms),
+        "batch crosses PCIe into VRAM" if gpu else "no-op on CPU",
+    )
+    ms(
+        "inference",
+        med(lambda t: t.compute_ms),
+        "CUDA kernels on the SMs" if gpu else "CPU forward pass",
+    )
+    ms("device -> host", med(lambda t: t.d2h_ms), "logits come back" if gpu else "no-op on CPU")
     ms("postprocess", postprocess_ms, "softmax + top-k on CPU")
     print(f"  {'-' * 58}")
     ms("engine total", inference_total, "")
