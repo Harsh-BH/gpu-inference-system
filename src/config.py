@@ -106,7 +106,10 @@ class Settings(BaseSettings):
     # These two numbers are the entire latency/throughput dial of the system.
     # Bigger batch: better GPU utilisation, more VRAM, higher tail latency.
     # Longer wait: fuller batches under light load, but every request pays it.
-    max_batch_size: int = Field(default=8, ge=1, le=256)
+    # Upper bound is a sanity check, not a policy: it exists to reject a typo'd
+    # 100000, while still leaving room for scripts/gpu_memory_report.py to probe
+    # past any sane serving value on purpose. The serving default stays 8.
+    max_batch_size: int = Field(default=8, ge=1, le=1024)
     max_batch_wait_ms: float = Field(default=5.0, ge=0.0, le=1000.0)
 
     # --- Queue / backpressure -------------------------------------------
