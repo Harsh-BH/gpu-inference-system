@@ -520,16 +520,93 @@ rather than a hope.
 
 ---
 
+## Experiment 11 — What the ONNX export silently changed
+
+**Hypothesis.** Exporting to ONNX is a format conversion. The graph should
+mirror the PyTorch module, and the flags requested should be the flags applied.
+
+**Setup.** `scripts/export_onnx.py`, torch 2.13 dynamo exporter, opset 17
+requested, dynamic batch dimension in [1, 64]. Verified with
+`onnx.checker.check_model(full_check=True)`, then against PyTorch via ONNX
+Runtime on the CPU provider.
+
+**Measurement.**
+
+```
+51 nodes across 9 operator types
+  20 Conv   17 Relu   8 Add   1 each: Shape, MaxPool, ReduceMean, Concat, Reshape, Gemm
+
+input   [batch, 3, 224, 224] float      output  [batch, 1000] float
+44 initializers, 44.57 MiB
+```
+
+| check | result |
+|---|---|
+| `onnx.checker` full_check | passed |
+| top-1 agreement vs PyTorch | 100% |
+| max &#124;Δlogit&#124; vs PyTorch | 4.29e-06 |
+| dynamic batch 1 / 3 / 8 | all accepted |
+
+**Result.** The maths survived exactly. Three other things did not match the
+hypothesis.
+
+1. **BatchNorm is gone.** The PyTorch module has 20 `BatchNorm2d` layers; the
+   graph has **zero** `BatchNormalization` nodes and 20 `Conv`.
+2. **Opset 17 was requested; opset 18 was produced.** No error, no exception.
+3. **The artifact was two files.** `model.onnx` was 95 KiB; the weights were in
+   a sibling `model.onnx.data` of 46.8 MB.
+
+**Explanation.**
+
+*BatchNorm folding.* In `eval()` mode BatchNorm is a fixed affine transform,
+`y = γ(x−μ)/√(σ²+ε) + β`, with all four terms constant. An affine transform on
+a convolution's output can be absorbed into that convolution's weights and
+bias, producing identical arithmetic with 20 fewer kernel launches and 20 fewer
+round trips through VRAM for intermediates. This is operator fusion, and it
+happened **at export**, before any runtime existed. Worth pinning down now: a
+later "TensorRT fused our BatchNorms" claim would be false, because there were
+none left to fuse.
+
+*Opset.* The dynamo exporter emits opset 18 natively and then attempts ONNX's
+version down-converter. When that conversion fails it keeps 18 and continues
+without raising. Someone pinning opset 17 for a downstream compiler would get
+18 and only discover it when the compiler refused the graph.
+
+*External data.* `torch.onnx.export(external_data=...)` defaults to `True`,
+which splits weights into a sibling file. A `model.onnx` that loads and then
+fails at first inference because its `.data` was not copied is a deployment
+footgun. At 45 MB there is no reason for it — protobuf's ceiling is 2 GB.
+
+**Trade-off / what changed.**
+
+- `external_data=False`: one self-contained 44.66 MiB artifact.
+- The script now compares requested opset against produced opset and warns
+  loudly. Default raised to 18, which is what actually comes out.
+- `.gitignore` gained `models/**/*.onnx.data` — the existing
+  `models/**/*.onnx` pattern does **not** match it, so 46 MB was one `git add`
+  from being tracked.
+- A test asserts 20 Conv / 0 BatchNormalization, so the folding is recorded
+  rather than rediscovered.
+
+The dynamic batch axis costs something real, and it is worth naming: a runtime
+that knows a dimension exactly can specialise kernels and preallocate for it.
+ONNX Runtime absorbs the uncertainty transparently; TensorRT makes it an
+explicit optimisation profile (Phase 8). Height and width stay fixed at 224
+precisely because they never vary — making them dynamic would forfeit
+optimisation for nothing.
+
+---
+
 ## Pending
 
 | # | Experiment | Phase |
 |---|---|---|
-| 11 | PyTorch vs ONNX Runtime | 7 |
-| 12 | ONNX Runtime vs TensorRT | 9 |
-| 13 | Static vs dynamic batching | 11 |
-| 14 | Cold start vs warm inference | 13 |
-| 15 | Concurrent users | 12 |
-| 16 | CUDA streams | 18 |
-| 17 | Pinned memory and non-blocking transfer | 19 |
-| 18 | CUDA Graphs | 20 |
-| 19 | INT8 quantisation | 21 |
+| 12 | PyTorch vs ONNX Runtime | 7 |
+| 13 | ONNX Runtime vs TensorRT | 9 |
+| 14 | Static vs dynamic batching | 11 |
+| 15 | Cold start vs warm inference | 13 |
+| 16 | Concurrent users | 12 |
+| 17 | CUDA streams | 18 |
+| 18 | Pinned memory and non-blocking transfer | 19 |
+| 19 | CUDA Graphs | 20 |
+| 20 | INT8 quantisation | 21 |
