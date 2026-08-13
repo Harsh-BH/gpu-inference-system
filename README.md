@@ -37,35 +37,6 @@ in a benchmark rather than a claim.
 6 GB is a real constraint and that is deliberate: it forces the memory phases to be honest
 rather than theoretical.
 
-## Status
-
-Built incrementally. Each phase leaves the system working.
-
-| Phase | Component | Status |
-|---|---|---|
-| 0 | Environment + GPU verification | **done** |
-| 1 | Baseline PyTorch inference path | **done** |
-| 2 | Tensor introspection | **done** |
-| 3 | GPU memory profiling + OOM experiment | **done** |
-| 4 | Batch size benchmark | next |
-| 5 | FP32 vs FP16 | pending |
-| 6 | ONNX export | pending |
-| 7 | ONNX Runtime backend | pending |
-| 8 | TensorRT engine build | pending |
-| 9 | Cross-backend benchmark | pending |
-| 10 | Request queue | pending |
-| 11 | Dynamic batching | pending |
-| 12 | Concurrency testing | pending |
-| 13 | Model warmup | pending |
-| 14 | Model versioning | pending |
-| 15 | HTTP API | pending |
-| 16 | Observability | pending |
-| 17 | Failure handling | pending |
-| 18 | CUDA streams experiment | pending |
-| 19 | Transfer optimization | pending |
-| 20 | CUDA Graphs experiment | pending |
-| 21 | INT8 quantization | pending |
-| 22 | Final architecture + report | pending |
 
 ## Quickstart
 
