@@ -46,8 +46,8 @@ Built incrementally. Each phase leaves the system working.
 | 0 | Environment + GPU verification | **done** |
 | 1 | Baseline PyTorch inference path | **done** |
 | 2 | Tensor introspection | **done** |
-| 3 | GPU memory profiling + OOM experiment | next |
-| 4 | Batch size benchmark | pending |
+| 3 | GPU memory profiling + OOM experiment | **done** |
+| 4 | Batch size benchmark | next |
 | 5 | FP32 vs FP16 | pending |
 | 6 | ONNX export | pending |
 | 7 | ONNX Runtime backend | pending |
@@ -120,6 +120,24 @@ baseline the other runtimes get compared against is genuinely FP32.
 **Naive GPU timing lies by ~89x.** The same matmul reports 0.065 ms without
 `torch.cuda.synchronize()` and 5.723 ms with it, because kernel launches are asynchronous.
 Every timing in this repo synchronises explicitly.
+
+### VRAM, fully accounted
+
+`uv run python scripts/gpu_memory_report.py`
+
+```
+CUDA context                104.81 MiB   before a single tensor exists
+ResNet-18 FP32 weights       44.69 MiB   (44.59 MiB predicted)
+peak, batch 1                27.05 MiB
+peak, batch 32              214.38 MiB   ~6.7 MiB marginal per image
+cuBLAS workspace              8.12 MiB   survives unload(), owned by no Python object
+```
+
+Memory is **affine, not proportional**: 1 → 32 images is 32× the work but only 7.9× the
+peak, because weights are paid once and only activations scale. The script also drives a
+deliberate OOM (batch 1024 against a 4.25 GiB cap) and shows the process serving normally
+afterwards — the allocator is capped with `set_per_process_memory_fraction` rather than
+exhausting physical VRAM, since this GPU also drives the display.
 
 ## Layout
 

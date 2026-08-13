@@ -135,19 +135,158 @@ are measured separately for that reason.
 
 ---
 
+## Experiment 4 — Where the VRAM actually goes
+
+**Hypothesis.** VRAM usage is roughly the model weights (~45 MB for ResNet-18
+FP32) plus the input batch, and it scales linearly with batch size.
+
+**Setup.** `scripts/gpu_memory_report.py`, FP32, allocator capped at 75% of
+5.67 GiB. `reset_peak_memory_stats()` before each measurement so peaks are
+isolated rather than cumulative.
+
+**Measurement.**
+
+| stage | allocated | reserved | transient peak |
+|---|---|---|---|
+| CUDA context (before any tensor) | 0 | 0 | — (104.81 MiB of *device* memory) |
+| model load | +44.69 MiB | +62.00 MiB | 44.69 MiB |
+| warmup, 10 × batch 1 | +8.12 MiB | +32.00 MiB | 35.18 MiB |
+
+| batch | input | transient peak | peak / image |
+|---|---|---|---|
+| 1 | 588.00 KiB | 27.05 MiB | 27.05 MiB |
+| 2 | 1.15 MiB | 28.11 MiB | 14.05 MiB |
+| 4 | 2.30 MiB | 30.79 MiB | 7.70 MiB |
+| 8 | 4.59 MiB | 53.59 MiB | 6.70 MiB |
+| 16 | 9.19 MiB | 109.19 MiB | 6.82 MiB |
+| 32 | 18.38 MiB | 214.38 MiB | 6.70 MiB |
+
+**Result.** Hypothesis was directionally right and quantitatively wrong in
+three ways.
+
+1. **The CUDA context costs 104.81 MiB before a single tensor exists** and is
+   invisible to `memory_allocated()`.
+2. **Memory is affine, not proportional.** 1 → 32 images is 32× the work but
+   only 7.9× the peak. Beyond batch 4 the marginal cost settles at ~6.7 MiB per
+   image; below that a fixed component dominates.
+3. **The input batch is negligible.** At batch 32 the input is 18 MiB of a
+   214 MiB peak. Activations, not inputs, are what fill a GPU.
+
+**Explanation.** Three separate pools are in play. The weights are paid once
+and never grow. The activations are transient — under `inference_mode` each
+intermediate is freed once the next layer consumes it, so the peak is the
+largest few tensors alive at once, not their sum. And `reserved` exceeds
+`allocated` throughout because PyTorch's caching allocator does not `cudaFree`
+on every tensor death; `cudaMalloc`/`cudaFree` synchronise the device, so
+per-tensor freeing would serialise the pipeline.
+
+The affine shape is why per-image memory falls with batch size: the fixed
+component (cuDNN workspace, weights already resident) is amortised over more
+images, exactly as the fixed *time* cost is.
+
+**Trade-off.** Larger batches are more memory-efficient per image right up to
+the point where they are not available at all. The peak is what OOMs, the peak
+is transient, and it is invisible to any monitoring that samples current
+allocation. `MAX_BATCH_SIZE` is therefore a memory ceiling first and a
+throughput knob second.
+
+---
+
+## Experiment 5 — Deliberate OOM, and surviving it
+
+**Hypothesis.** Doubling batch size until CUDA OOM will raise a catchable
+error, and the process can continue serving afterwards.
+
+**Setup.** Same script, allocator capped at 4.25 GiB via
+`set_per_process_memory_fraction()` — deliberately, because this GPU also
+drives the display and exhausting physical VRAM can hang the compositor. That
+cap is itself the production technique for stopping one model from starving
+everything else on a shared card.
+
+**Measurement.**
+
+| batch | outcome | transient peak |
+|---|---|---|
+| 64 | ok | 428.75 MiB |
+| 128 | ok | 857.50 MiB |
+| 256 | ok | 1.67 GiB |
+| 512 | ok | 3.35 GiB |
+| 1024 | **OOM** | — |
+
+After `empty_cache()`, batch 1 served normally: `(1, 1000)` logits in 4.44 ms.
+
+**Result.** Confirmed. Batch 1024 needed roughly 6.7 GiB against a 4.25 GiB
+ceiling and failed; the process recovered fully.
+
+**Explanation.** Activations scale linearly while weights stay fixed, so a
+large enough batch needs a contiguous block the allocator cannot supply. The
+recovery matters more than the failure: the engine catches
+`torch.cuda.OutOfMemoryError`, calls `empty_cache()` so the failed request's
+reserved blocks do not poison the next one, and re-raises as `EngineError` —
+which the API layer maps to 503 rather than a stack trace.
+
+**Trade-off.** `empty_cache()` on the OOM path is correct but not free: it
+synchronises the device and makes subsequent allocations slower until the pool
+regrows. That is the right price on a failure path and the wrong one on the
+request path, which is why it appears in exactly two places — OOM recovery and
+model unload.
+
+---
+
+## Experiment 6 — The 8 MiB that survives `unload()`
+
+**Hypothesis.** After unloading the model and calling `empty_cache()`,
+`memory_allocated()` returns to zero.
+
+**Setup.** Load, run one inference, unload, `gc.collect()`, `empty_cache()`,
+then walk `gc.get_objects()` for live CUDA tensors. Then vary
+`CUBLAS_WORKSPACE_CONFIG`.
+
+**Measurement.**
+
+```
+after load          44.69 MiB
+after 1 predict     52.82 MiB      (+8.12 MiB)
+after unload + gc    8.12 MiB
+live CUDA tensors reachable from Python:  none
+```
+
+| `CUBLAS_WORKSPACE_CONFIG` | residual |
+|---|---|
+| `:4096:2:16:8` (torch default) | 8.12 MiB — 4096 KiB × 2 + 16 KiB × 8 |
+| `:1024:4` | 4.00 MiB |
+| `:16:8` | 128.00 KiB |
+
+**Result.** Hypothesis was wrong. The residual is the **cuBLAS workspace**,
+allocated on the first GEMM (ResNet-18's final `fc` layer) and cached per
+handle+stream for the lifetime of the process. cuDNN was ruled out first —
+disabling it left the residual unchanged.
+
+**Explanation.** cuBLAS keeps a scratch buffer per handle so that GEMM kernels
+have somewhere to stage partial results without allocating per call. It belongs
+to the library, not to any Python object, so no amount of `del` or
+`gc.collect()` reclaims it.
+
+**Trade-off.** Shrinking it via `CUBLAS_WORKSPACE_CONFIG` is possible and
+almost always wrong — a smaller workspace forces cuBLAS toward slower kernels.
+8 MiB on a 6 GB card is not worth optimising. It is worth *knowing*, because
+"`memory_allocated()` is non-zero after I freed everything" otherwise reads as
+a leak, and hunting a leak that does not exist costs a day.
+
+---
+
 ## Pending
 
 | # | Experiment | Phase |
 |---|---|---|
-| 4 | Batch size sweep (VRAM, latency, throughput) | 4 |
-| 5 | FP32 vs FP16 vs TF32 | 5 |
-| 6 | PyTorch vs ONNX Runtime | 7 |
-| 7 | ONNX Runtime vs TensorRT | 9 |
-| 8 | Static vs dynamic batching | 11 |
-| 9 | Cold start vs warm inference | 13 |
-| 10 | GPU memory usage and OOM | 3 |
-| 11 | Concurrent users | 12 |
-| 12 | CUDA streams | 18 |
-| 13 | Pinned memory and non-blocking transfer | 19 |
-| 14 | CUDA Graphs | 20 |
-| 15 | INT8 quantisation | 21 |
+| 7 | Batch size vs latency and throughput | 4 |
+| 8 | FP32 vs FP16 vs TF32 | 5 |
+| 9 | PyTorch vs ONNX Runtime | 7 |
+| 10 | ONNX Runtime vs TensorRT | 9 |
+| 11 | Static vs dynamic batching | 11 |
+| 12 | Cold start vs warm inference | 13 |
+| 13 | Concurrent users | 12 |
+| 14 | CUDA streams | 18 |
+| 15 | Pinned memory and non-blocking transfer | 19 |
+| 16 | CUDA Graphs | 20 |
+| 17 | INT8 quantisation | 21 |
