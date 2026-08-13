@@ -135,6 +135,34 @@ reported as `(within noise)` instead of as findings.
 an engine peak of 703 — a **15×** gap. Saturating this GPU needs ~15 concurrent
 preprocessing workers, which is why the queue and batching phases come before TensorRT.
 
+### Precision: FP16 wins, but only once batching makes the GPU compute-bound
+
+`uv run python scripts/benchmark_precision.py --profile-kernels`
+
+| batch | mode | p50 ms | img/s | peak VRAM | vs fp32 |
+|---|---|---|---|---|---|
+| 8 | fp32 | 15.34 | 537.6 | 106.41 MiB | 1.00× |
+| 8 | tf32 | 11.67 | 650.2 | 106.41 MiB | 1.21× |
+| 8 | **fp16** | **8.04** | **996.4** | **60.95 MiB** | **1.85×** |
+| 32 | **fp16** | **27.65** | **1148.0** | **152.27 MiB** | **1.82×** |
+
+FP16 halves the weights (44.69 → 22.96 MiB) and gives ~1.8× throughput with **100% top-1
+agreement** against FP32 on 32 real image crops (max logit drift 3.4e-02). TF32 gives a
+free 1.1–1.2× with no storage change at all.
+
+**Batch 1 is not reported as a gain.** Across five independent runs FP16/FP32 at batch 1
+measured 1.52×, 1.03×, 1.31×, 1.19×, 1.12× while FP32 stayed within 4% of itself — that
+range is jitter. At ~2.6 ms of GPU work the pipeline is launch-bound, not arithmetic-bound,
+and halving the arithmetic cannot help.
+
+`--profile-kernels` turns "presumably Tensor Cores" into evidence. FP32 runs
+`scudnn_winograd` on CUDA cores and never touches a Tensor Core; FP16 runs
+`cutlass_tensorop_f16_s16816`. But FP16 also spends **22.4% of GPU time** on
+`nchwToNhwc` + `nhwcToNchw` transposes — converting to the layout Tensor Cores want, per
+operator, and back. It wins 1.8× *while* wasting a quarter of its time shuffling memory.
+Eliminating that is what TensorRT's whole-graph layout planning does, which gives Phase 8
+a concrete target rather than a hope.
+
 ## Layout
 
 ```

@@ -419,11 +419,111 @@ and concurrency phases come before TensorRT.
 
 ---
 
+## Experiment 10 — FP32 vs TF32 vs FP16
+
+**Hypothesis.** FP16 halves weight memory and roughly doubles throughput via
+Tensor Cores, at some cost in numerical accuracy. TF32 sits between the two.
+
+**Setup.** `scripts/benchmark_precision.py`, 300 iterations per (batch, mode).
+
+Two methodology choices carried over from Experiment 8:
+
+- **Interleaved and rotated.** All three precisions are measured back-to-back
+  within each batch size, and the order rotates per batch size, so every mode
+  runs first, middle and last across the sweep. Comparing precisions is where
+  thermal drift would do the most damage — a "10% FP16 win" is worthless if
+  FP16 simply ran first.
+- **Agreement on real image content.** 32 random crops at varying scale from
+  the sample photo, not gaussian noise. FP16's error depends on activation
+  magnitude, and unstructured input does not produce activations that transfer.
+
+**Measurement.**
+
+Weights in VRAM (11,689,512 parameters):
+
+| mode | weights | vs fp32 |
+|---|---|---|
+| fp32 | 44.69 MiB | 1.00× |
+| tf32 | 44.69 MiB | 1.00× — identical, TF32 changes the maths not the bytes |
+| fp16 | 22.96 MiB | 0.51× |
+
+Agreement vs FP32:
+
+| mode | top-1 | top-5 | max &#124;Δlogit&#124; | mean &#124;Δlogit&#124; | max Δconf |
+|---|---|---|---|---|---|
+| tf32 | 100.0% | 100.0% | 1.03e-02 | 1.28e-03 | 8.25e-04 |
+| fp16 | 100.0% | 100.0% | 3.44e-02 | 4.59e-03 | 6.51e-03 |
+
+Throughput and peak VRAM:
+
+| batch | mode | p50 ms | img/s | peak VRAM | vs fp32 |
+|---|---|---|---|---|---|
+| 8 | fp32 | 15.34 | 537.6 | 106.41 MiB | 1.00× |
+| 8 | tf32 | 11.67 | 650.2 | 106.41 MiB | 1.21× |
+| 8 | **fp16** | **8.04** | **996.4** | **60.95 MiB** | **1.85×** |
+| 16 | fp32 | 24.95 | 649.3 | 162.00 MiB | 1.00× |
+| 16 | tf32 | 22.16 | 707.3 | 162.00 MiB | 1.09× |
+| 16 | **fp16** | **14.97** | **1091.6** | **91.09 MiB** | **1.68×** |
+| 32 | fp32 | 50.58 | 630.0 | 267.19 MiB | 1.00× |
+| 32 | tf32 | 43.84 | 729.1 | 267.19 MiB | 1.16× |
+| 32 | **fp16** | **27.65** | **1148.0** | **152.27 MiB** | **1.82×** |
+
+**Result.** Hypothesis mostly confirmed, with one important exception.
+
+- FP16: **~1.8× throughput, 0.51× weights, 0.57× peak VRAM, 100% top-1
+  agreement.** A clear win at batch ≥ 8.
+- TF32: a consistent **1.1–1.2×** for free — no storage change, no top-1 change.
+- **Batch 1 is not a gain.** Across five independent runs FP16/FP32 at batch 1
+  measured 1.52×, 1.03×, 1.31×, 1.19×, 1.12×, while FP32 at batch 1 stayed
+  within 4% of itself. That range is jitter, not a speedup, and it is reported
+  as such rather than cherry-picked.
+
+**Explanation.** `--profile-kernels` replaces inference with evidence. At
+batch 32 the hottest CUDA kernels are:
+
+```
+fp32   scudnn_128x64_relu_xregs      36.4%   CUDA cores, NCHW
+       scudnn_winograd_128x128        26.4%   CUDA cores, Winograd
+tf32   sm86_xmma_..._tf32f32_...      13.0%   Tensor Core
+       nchwToNhwcKernel<float>        12.9%   layout conversion, no maths
+fp16   batch_norm_transform<Half>     14.1%
+       nchwToNhwcKernel<__half>       12.0%   layout conversion
+       nhwcToNchwKernel<__half>       10.4%   layout conversion
+       cutlass_tensorop_f16_s16816     9.3%   Tensor Core, 16x8x16 MMA
+```
+
+Three things follow. FP32 never touches a Tensor Core — it runs Winograd on
+CUDA cores, which is why it is respectable rather than terrible. TF32 and FP16
+do reach Tensor Cores (`xmma`, `cutlass_tensorop`, `s16816`). And **FP16 spends
+22.4% of its GPU time purely converting NCHW to the NHWC layout Tensor Cores
+want and back again**, per operator.
+
+Why batch 1 gains nothing: at ~2.6 ms of GPU work the pipeline is bound by
+kernel launches and layout conversions rather than arithmetic, and halving the
+arithmetic does not help a workload that is not arithmetic-bound. Batching is
+what makes the GPU compute-bound, and only then does precision pay.
+
+**Trade-off.** FP16 is the right default for this workload *at batch ≥ 8*, and
+the accuracy cost is real but small — top-1 identical on every sample tested,
+with logit drift 3.4e-02 versus TF32's 1.03e-02. Where FP16 does bite is
+dynamic range: float16 overflows above 65504 and underflows below ~6e-5, so
+models with large activations, accumulations over long sequences, or
+loss-scaling-sensitive layers can produce inf/nan where FP32 would not.
+ResNet-18 classification is nowhere near those limits. A model that is would
+need BF16 instead — same 8 exponent bits as FP32, 7 mantissa bits, so it
+trades precision for range.
+
+The 22.4% layout tax is the actionable finding: FP16 wins 1.8× *while* wasting
+nearly a quarter of its time shuffling memory. Eliminating that is exactly what
+TensorRT's whole-graph layout planning does, so Phase 8 has a concrete target
+rather than a hope.
+
+---
+
 ## Pending
 
 | # | Experiment | Phase |
 |---|---|---|
-| 10 | FP32 vs FP16 vs TF32 | 5 |
 | 11 | PyTorch vs ONNX Runtime | 7 |
 | 12 | ONNX Runtime vs TensorRT | 9 |
 | 13 | Static vs dynamic batching | 11 |
