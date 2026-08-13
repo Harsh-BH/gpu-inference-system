@@ -29,7 +29,15 @@ dependencies = [
 # Optional on purpose. The whole point of the InferenceEngine abstraction is
 # that the serving layer runs without these installed -- a missing backend must
 # degrade to a clean startup error, not an import crash.
-onnx = ["onnx>=1.17", "onnxruntime-gpu>=1.20"]
+onnx = [
+    "onnx>=1.17",
+    "onnxruntime-gpu>=1.20",
+    # Required by torch.onnx.export(dynamo=True), which is the default in
+    # torch 2.13. The dynamo exporter traces through torch.export instead of
+    # TorchScript; onnxscript is what it lowers ATen ops through. The legacy
+    # TorchScript exporter needs no extra package but is deprecated.
+    "onnxscript>=0.2",
+]
 trt = ["tensorrt>=10.7"]
 
 [dependency-groups]

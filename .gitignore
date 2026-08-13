@@ -15,6 +15,9 @@ __pycache__/
 models/**/*.pth
 models/**/*.pt
 models/**/*.onnx
+# Sibling weight blob when a model is exported with external data. NOT matched
+# by the *.onnx pattern above -- it ends in .data -- and it is ~46 MB.
+models/**/*.onnx.data
 models/**/*.engine
 models/**/*.plan
 models/**/*.cache
