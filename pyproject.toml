@@ -18,6 +18,11 @@ dependencies = [
     "uvicorn[standard]>=0.32",
     "python-multipart>=0.0.20",  # required by FastAPI for multipart file upload
     "prometheus-client>=0.21",
+    # Pure-python NVML binding, ~50 KB. Unlocks torch.cuda.clock_rate/power_draw/
+    # temperature/utilization, which torch ships support for but cannot use
+    # without it. Needed to tell a real speedup from a thermal artefact, and
+    # again for gpu_utilization in Phase 16.
+    "nvidia-ml-py>=12.560",
 ]
 
 [project.optional-dependencies]
