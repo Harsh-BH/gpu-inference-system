@@ -1,0 +1,55 @@
+[project]
+name = "gpu-inference-system"
+version = "0.1.0"
+description = "End-to-end GPU inference platform: HTTP request -> queue -> batch -> tensor -> CUDA kernel -> response"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+
+# Core dependencies: everything needed for the serving layer and the PyTorch
+# baseline backend. Deliberately does NOT include onnx/tensorrt -- see extras.
+dependencies = [
+    "torch>=2.6",
+    "torchvision>=0.21",
+    "numpy>=2.0",
+    "pillow>=11.0",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "python-multipart>=0.0.20",  # required by FastAPI for multipart file upload
+    "prometheus-client>=0.21",
+]
+
+[project.optional-dependencies]
+# Optional on purpose. The whole point of the InferenceEngine abstraction is
+# that the serving layer runs without these installed -- a missing backend must
+# degrade to a clean startup error, not an import crash.
+onnx = ["onnx>=1.17", "onnxruntime-gpu>=1.20"]
+trt = ["tensorrt>=10.7"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.28",       # FastAPI TestClient transport
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# Installed editable by `uv sync`, which is what makes `import src.config` work
+# from scripts/ and tests/ without sys.path hacks.
+packages = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

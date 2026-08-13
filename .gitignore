@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Local configuration (secrets, machine-specific overrides)
+.env
+
+# Model artifacts: large, regenerable, and hardware-specific.
+# TensorRT engines in particular are tied to GPU arch + driver + TRT version,
+# so committing them would be actively misleading to anyone else cloning this.
+models/**/*.pth
+models/**/*.pt
+models/**/*.onnx
+models/**/*.engine
+models/**/*.plan
+models/**/*.cache
+
+# Sample images pulled at runtime
+data/
+
+# Benchmark *results* are committed on purpose (they are the deliverable).
+# Only scratch files are ignored.
+benchmarks/**/*.tmp
