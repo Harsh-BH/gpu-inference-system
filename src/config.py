@@ -1,0 +1,164 @@
+"""Typed configuration — the single source of truth for every tunable knob.
+
+WHY this exists as its own module:
+
+A serving system has two kinds of "settings". The first kind is a value you
+change to run an experiment (batch size, precision, backend). The second kind
+is a value that, if wrong, should stop the process at boot rather than surface
+as a confusing failure ten minutes into a load test (a device string of
+"cuda:9", a batch size of 0).
+
+Scattering `os.environ.get(...)` through the codebase gets you neither. You get
+untyped strings validated nowhere, defaults duplicated in three files, and no
+single place to answer "what is this server actually configured to do?".
+
+So: one model, validated once, at import. Invalid configuration is a startup
+crash with a readable message. That is a feature.
+"""
+
+from __future__ import annotations
+
+import re
+from enum import StrEnum
+from functools import lru_cache
+from pathlib import Path
+
+from pydantic import Field, computed_field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_DEVICE_RE = re.compile(r"^(cpu|cuda(:\d+)?)$")
+
+
+class Backend(StrEnum):
+    """Which runtime executes the model.
+
+    This is an enum rather than a string so an unknown backend fails at config
+    parse time, next to the typo, instead of as a KeyError inside the engine
+    registry after the server has already reported itself healthy.
+    """
+
+    PYTORCH = "pytorch"
+    ONNXRUNTIME = "onnxruntime"
+    TENSORRT = "tensorrt"
+
+
+class Precision(StrEnum):
+    """Numeric precision of the weights and activations at inference time.
+
+    Deliberately explicit. A model is never silently downcast: FP16 changes
+    numerical results, and a system that quietly halves your precision to look
+    good on a benchmark is lying to you. You ask for it or you don't get it.
+    """
+
+    FP32 = "fp32"
+    FP16 = "fp16"
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        # pydantic reserves the `model_` prefix for its own methods; our domain
+        # genuinely is models, so we reclaim the namespace.
+        protected_namespaces=(),
+    )
+
+    # --- Model identity -------------------------------------------------
+    # Nothing in src/ may build a model path by hand. Everything resolves
+    # through `model_dir` so that swapping versions is a config change, not
+    # a code change (Phase 14).
+    model_repository: Path = Path("models")
+    model_name: str = "resnet18"
+    model_version: str = "v1"
+
+    # --- Execution ------------------------------------------------------
+    backend: Backend = Backend.PYTORCH
+    precision: Precision = Precision.FP32
+    device: str = "cuda:0"
+
+    # --- Preprocessing --------------------------------------------------
+    image_size: int = Field(default=224, ge=32, le=1024)
+
+    # --- Batching -------------------------------------------------------
+    # These two numbers are the entire latency/throughput dial of the system.
+    # Bigger batch: better GPU utilisation, more VRAM, higher tail latency.
+    # Longer wait: fuller batches under light load, but every request pays it.
+    max_batch_size: int = Field(default=8, ge=1, le=256)
+    max_batch_wait_ms: float = Field(default=5.0, ge=0.0, le=1000.0)
+
+    # --- Queue / backpressure -------------------------------------------
+    # Bounded, always. An unbounded queue does not absorb overload, it defers
+    # it — turning a recoverable 503 into an OOM kill and dropping every
+    # in-flight request instead of the few that arrived last.
+    queue_max_size: int = Field(default=100, ge=1)
+    request_timeout_ms: float = Field(default=10_000.0, gt=0)
+
+    # --- Warmup ---------------------------------------------------------
+    # The first inference on a fresh CUDA context pays context creation,
+    # kernel module loading, cuDNN algorithm selection and allocator growth.
+    # That can be hundreds of milliseconds. We pay it at boot; a user must
+    # never be the one who pays it.
+    warmup_requests: int = Field(default=10, ge=0)
+
+    # --- Limits / safety ------------------------------------------------
+    max_upload_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
+    # Guards against decompression bombs: a 10 KB PNG can declare a
+    # 60000x60000 canvas and allocate ~10 GB when decoded.
+    max_image_pixels: int = Field(default=50_000_000, gt=0)
+
+    # --- Observability --------------------------------------------------
+    log_level: str = "INFO"
+
+    @field_validator("device")
+    @classmethod
+    def _validate_device(cls, v: str) -> str:
+        v = v.strip().lower()
+        if not _DEVICE_RE.match(v):
+            raise ValueError(f"device must be 'cpu', 'cuda' or 'cuda:N', got {v!r}")
+        return v
+
+    @field_validator("log_level")
+    @classmethod
+    def _validate_log_level(cls, v: str) -> str:
+        v = v.strip().upper()
+        valid = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+        if v not in valid:
+            raise ValueError(f"log_level must be one of {sorted(valid)}, got {v!r}")
+        return v
+
+    @computed_field
+    @property
+    def model_dir(self) -> Path:
+        """Where this model version's artifacts live.
+
+        models/<name>/<version>/ — holds weights, model.onnx, and per-precision
+        TensorRT engines. Resolving it here is what keeps every other module
+        free of hardcoded paths.
+        """
+        return self.model_repository / self.model_name / self.model_version
+
+    @computed_field
+    @property
+    def is_cuda(self) -> bool:
+        return self.device.startswith("cuda")
+
+    @computed_field
+    @property
+    def device_index(self) -> int | None:
+        """GPU ordinal, or None on CPU. `cuda` with no index means device 0."""
+        if not self.is_cuda:
+            return None
+        _, _, idx = self.device.partition(":")
+        return int(idx) if idx else 0
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    """Process-wide settings, parsed once.
+
+    Cached rather than a module-level global so tests can swap the environment
+    and call `get_settings.cache_clear()`, and so importing this module has no
+    side effect on a machine with a broken .env.
+    """
+    return Settings()
