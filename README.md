@@ -110,6 +110,31 @@ deliberate OOM (batch 1024 against a 4.25 GiB cap) and shows the process serving
 afterwards — the allocator is capped with `set_per_process_memory_fraction` rather than
 exhausting physical VRAM, since this GPU also drives the display.
 
+### Batching: better until the accelerator is full
+
+`uv run python scripts/benchmark.py --iterations 500`
+
+| batch | p50 ms | img/s | ms/img | peak VRAM | SM clock |
+|---|---|---|---|---|---|
+| 1 | 2.50 | 331.7 | 2.505 | 79.87 MiB | 1800 MHz |
+| 8 | 13.35 | 591.7 | 1.668 | 106.41 MiB | 1642 MHz |
+| **16** | **23.01** | **702.5** | **1.438** | 162.00 MiB | 1680 MHz |
+| 32 | 46.83 | 681.8 | 1.464 | 267.19 MiB | 1657 MHz |
+
+**16× the batch buys 2.1× the throughput, not 16×.** Throughput plateaus at batch 16;
+past it, batch 32 costs 2.0× the latency and 1.6× the VRAM for 0.97× the throughput.
+
+The first reading of this sweep said throughput *dropped* at batch 32. That was wrong —
+re-running the two sizes in isolation gave 662.9 and 665.2 img/s, indistinguishable. This
+is a 60 W laptop GPU and the sweep measures each successive batch size on a hotter, slower
+device (1800 → 1657 MHz as temperature climbs 77 → 85 °C). Every benchmark row now records
+SM clock, power and temperature, and differences under a measured 5% noise floor are
+reported as `(within noise)` instead of as findings.
+
+**And the engine is not the system.** One preprocessing thread sustains ~46 img/s against
+an engine peak of 703 — a **15×** gap. Saturating this GPU needs ~15 concurrent
+preprocessing workers, which is why the queue and batching phases come before TensorRT.
+
 ## Layout
 
 ```

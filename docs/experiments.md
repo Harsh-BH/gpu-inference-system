@@ -275,18 +275,161 @@ a leak, and hunting a leak that does not exist costs a day.
 
 ---
 
+## Experiment 7 — Batch size vs latency, throughput and VRAM
+
+**Hypothesis.** Larger batches raise throughput and raise latency. Throughput
+should scale close to linearly until the GPU saturates.
+
+**Setup.** `scripts/benchmark.py --iterations 500`, ResNet-18 FP32, TF32 off,
+20 warmup iterations **per batch size** (cuDNN caches a convolution algorithm
+per input shape, so a new batch size is a new autotune), `empty_cache()`
+between sizes so each peak is its own.
+
+**Measurement.**
+
+| batch | p50 ms | p95 ms | img/s | ms/img | peak VRAM | SM clock |
+|---|---|---|---|---|---|---|
+| 1 | 2.50 | 4.50 | 331.7 | 2.505 | 79.87 MiB | 1800 MHz |
+| 2 | 3.77 | 5.71 | 450.8 | 1.886 | 80.92 MiB | 1747 MHz |
+| 4 | 8.23 | 8.47 | 525.7 | 2.056 | 83.60 MiB | 1740 MHz |
+| 8 | 13.35 | 15.22 | 591.7 | 1.668 | 106.41 MiB | 1642 MHz |
+| **16** | **23.01** | **24.65** | **702.5** | **1.438** | 162.00 MiB | 1680 MHz |
+| 32 | 46.83 | 48.94 | 681.8 | 1.464 | 267.19 MiB | 1657 MHz |
+
+| step | throughput | p50 latency | peak VRAM |
+|---|---|---|---|
+| 1 → 2 | 1.36× | 1.51× | 1.01× |
+| 2 → 4 | 1.17× | 2.18× | 1.03× |
+| 4 → 8 | 1.13× | 1.62× | 1.27× |
+| 8 → 16 | 1.19× | 1.72× | 1.52× |
+| 16 → 32 | 0.97× | 2.04× | 1.65× (within noise) |
+
+**Result.** Throughput plateaus at batch 16. **16× the batch buys 2.1× the
+throughput, not 16×.** Past the plateau, batch 32 costs 2.0× the latency and
+1.6× the VRAM for 0.97× the throughput.
+
+**Explanation.** Batching amortises fixed per-call cost — kernel launch
+overhead, Python dispatch, the weight reads that happen once regardless of
+batch size — across more images. That is why `ms/img` falls from 2.505 to
+1.438. But once the SMs are saturated the work becomes compute-bound, and
+adding images just adds proportional work. On this card, 20 SMs at a 60 W cap
+reach that point around batch 16.
+
+Latency, meanwhile, grows roughly linearly with batch size throughout, because
+every image in a batch waits for the whole batch to finish.
+
+**Trade-off.** This is the entire latency/throughput dial. Batch 1 gives
+2.50 ms p50 and 332 img/s; batch 16 gives 703 img/s at 23.01 ms p50 — 2.1× the
+throughput for 9.2× the latency. Neither is "better". The right batch size is
+whatever the latency SLO permits, and the answer to "is bigger batch better" is:
+better until the accelerator is full, pure cost afterwards.
+
+For dynamic batching (Phase 11) this sets `MAX_BATCH_SIZE`: above 16 there is
+nothing left to win here, and every millisecond spent waiting to fill a larger
+batch is charged to a client.
+
+---
+
+## Experiment 8 — The measurement that was wrong
+
+**Hypothesis.** (Stated after the first run of Experiment 7.) Throughput peaks
+at batch 16 and *declines* at batch 32 — 681.4 vs 666.0 img/s — so oversized
+batches actively hurt.
+
+**Setup.** Re-run batch 16 and batch 32 alone, in separate processes, rather
+than as the 5th and 6th rows of a sequential sweep. Then sample
+`nvidia-smi --query-gpu=clocks.sm,power.draw,temperature.gpu` during sustained
+load at each size.
+
+**Measurement.**
+
+| | in sweep (5th/6th) | run in isolation |
+|---|---|---|
+| batch 16 | 681.4 img/s | 662.9 img/s |
+| batch 32 | 666.0 img/s | 665.2 img/s |
+
+Under sustained load at *both* batch sizes:
+
+```
+batch 16   1665-1725 MHz   59.75-60.06 W   81-83 C   99% util
+batch 32   1627-1717 MHz   59.33-59.74 W   80-82 C   99-100% util
+idle       1912 MHz        44.42 W
+```
+
+**Result.** Hypothesis was wrong. In isolation the two batch sizes are
+indistinguishable (662.9 vs 665.2), and batch 16 itself moved 2.8% between its
+own two measurements. The "decline" was an artefact of running last.
+
+**Explanation.** This is a 60 W laptop GPU and it is power-limited, not
+thermally headroomed: it sits within 1% of its cap under load with SM clocks
+8–15% below boost. A sequential sweep therefore measures each successive batch
+size on a progressively hotter, slower device. In the final run the effect is
+plainly visible — 1800 MHz at batch 1 declining to 1657 MHz at batch 32 as
+temperature rises 77 → 85 °C.
+
+**Trade-off / what changed.** Three things, all in the harness rather than in
+the write-up:
+
+1. `nvidia-ml-py` added, and `src/gpu/telemetry.py` records SM clock, power and
+   temperature on **every** benchmark row. A benchmark that cannot see
+   throttling will attribute it to whatever it happened to be varying.
+2. `NOISE_FLOOR = 0.05`, derived from the measured run-to-run variation above.
+   Steps inside it are printed as `(within noise)` instead of being read as
+   results.
+3. The plateau is reported as the *first batch size statistically tied with the
+   best*, not the argmax — the argmax is what produced the false finding.
+
+The direction of the bias is worth keeping in mind: it runs against large
+batches, so the scaling in Experiment 7 is if anything understated.
+
+---
+
+## Experiment 9 — Engine throughput is not system throughput
+
+**Hypothesis.** The batch sweep's peak, 703 img/s, is what this system can
+serve.
+
+**Setup.** Measure preprocessing on the same sample image (`data/dog.jpg`,
+1546×1213 JPEG), median of 30 runs, single thread, and compare against the
+engine's peak throughput.
+
+**Measurement.**
+
+| | |
+|---|---|
+| preprocessing | 21.88 ms/image |
+| one CPU thread sustains | 45.7 img/s |
+| engine peak | 702.5 img/s (batch 16) |
+| **ratio** | **15.3×** |
+
+**Result.** Hypothesis was wrong by more than an order of magnitude. A single
+preprocessing thread can feed ~6.5% of what the GPU can consume.
+
+**Explanation.** JPEG decode, resize and normalise are serial CPU work that
+scales with *image* count, not batch count — batching does not help it at all.
+Saturating this GPU needs roughly 15 concurrent preprocessing workers.
+
+**Trade-off.** This is the number that orders the remaining phases. With one
+preprocessing thread the batch manager will never assemble a full batch under
+real load; it will hit `MAX_BATCH_WAIT_MS` waiting for images the CPU has not
+decoded yet, and the batch-16 row above describes hardware the system cannot
+reach. Making a 2.5 ms inference into 1 ms changes nothing while a 21 ms
+serial stage stands in front of it — which is why the queue, dynamic batching
+and concurrency phases come before TensorRT.
+
+---
+
 ## Pending
 
 | # | Experiment | Phase |
 |---|---|---|
-| 7 | Batch size vs latency and throughput | 4 |
-| 8 | FP32 vs FP16 vs TF32 | 5 |
-| 9 | PyTorch vs ONNX Runtime | 7 |
-| 10 | ONNX Runtime vs TensorRT | 9 |
-| 11 | Static vs dynamic batching | 11 |
-| 12 | Cold start vs warm inference | 13 |
-| 13 | Concurrent users | 12 |
-| 14 | CUDA streams | 18 |
-| 15 | Pinned memory and non-blocking transfer | 19 |
-| 16 | CUDA Graphs | 20 |
-| 17 | INT8 quantisation | 21 |
+| 10 | FP32 vs FP16 vs TF32 | 5 |
+| 11 | PyTorch vs ONNX Runtime | 7 |
+| 12 | ONNX Runtime vs TensorRT | 9 |
+| 13 | Static vs dynamic batching | 11 |
+| 14 | Cold start vs warm inference | 13 |
+| 15 | Concurrent users | 12 |
+| 16 | CUDA streams | 18 |
+| 17 | Pinned memory and non-blocking transfer | 19 |
+| 18 | CUDA Graphs | 20 |
+| 19 | INT8 quantisation | 21 |
