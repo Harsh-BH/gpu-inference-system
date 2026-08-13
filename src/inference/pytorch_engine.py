@@ -156,11 +156,18 @@ class PyTorchEngine(InferenceEngine):
     @property
     def metadata(self) -> EngineMetadata:
         s = self._settings
+        # Storage stays fp32 under TF32 -- only the convolution accumulation
+        # narrows to 10 mantissa bits -- so the two must be reported separately.
+        math_mode = s.precision.value
+        if s.precision is Precision.FP32 and s.is_cuda and s.allow_tf32:
+            math_mode = "tf32"
+
         return EngineMetadata(
             backend="pytorch",
             model_name=s.model_name,
             model_version=s.model_version,
             precision=s.precision.value,
+            math_mode=math_mode,
             device=s.device,
             input_shape=(3, s.image_size, s.image_size),
             max_batch_size=s.max_batch_size,

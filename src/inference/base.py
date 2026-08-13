@@ -113,7 +113,14 @@ class EngineMetadata:
     backend: str
     model_name: str
     model_version: str
-    precision: str
+    precision: str  # storage dtype of the weights: fp32 | fp16
+    # Precision the arithmetic actually runs at, which is NOT always the storage
+    # dtype. PyTorch on Ampere stores float32 and computes convolutions in TF32
+    # unless told otherwise; TensorRT picks per-layer tactics that may differ
+    # again. Reporting only `precision` would let two materially different
+    # configurations look identical in a benchmark table and an API response --
+    # the same silent-conversion problem this project refuses to tolerate.
+    math_mode: str  # fp32 | tf32 | fp16
     device: str
     input_shape: tuple[int, int, int]  # (C, H, W) for a single sample
     max_batch_size: int

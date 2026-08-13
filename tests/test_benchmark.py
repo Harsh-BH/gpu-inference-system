@@ -18,6 +18,7 @@ from src.benchmark import (
     P99_MIN_ITERATIONS,
     BenchmarkResult,
     benchmark_engine,
+    compare_logits,
     sweep_batch_sizes,
     write_results,
 )
@@ -58,6 +59,7 @@ class FakeEngine(InferenceEngine):
             model_name="fake",
             model_version="v1",
             precision="fp32",
+            math_mode="fp32",
             device="cpu",
             input_shape=SHAPE,
             max_batch_size=self._max,
@@ -171,3 +173,66 @@ def test_write_results_creates_missing_directories(results, tmp_path):
     out = tmp_path / "deep" / "nested"
     paths = write_results(results, out, "sweep")
     assert all(p.is_file() for p in paths)
+
+
+# --- numerical agreement --------------------------------------------------
+
+
+def _logits(rows: list[list[float]]) -> np.ndarray:
+    return np.array(rows, dtype=np.float32)
+
+
+def test_identical_logits_agree_perfectly():
+    a = _logits([[3.0, 1.0, 0.0], [0.0, 2.0, 1.0]])
+    r = compare_logits(a, a)
+    assert r.top1_agreement == 1.0
+    assert r.top5_agreement == 1.0
+    assert r.max_abs_logit_diff == 0.0
+    assert r.max_confidence_delta == 0.0
+    assert r.samples == 2
+
+
+def test_small_drift_keeps_top1_but_shows_in_logits():
+    # The FP16 signature: identical predictions, non-zero numerical distance.
+    # Reporting only top-1 would call this "no difference", which is how a
+    # precision regression hides until the inputs change.
+    ref = _logits([[5.0, 1.0, 0.0]])
+    cand = ref + np.array([[0.01, -0.01, 0.005]], dtype=np.float32)
+    r = compare_logits(ref, cand)
+    assert r.top1_agreement == 1.0
+    assert r.max_abs_logit_diff == pytest.approx(0.01, abs=1e-6)
+    assert r.max_confidence_delta > 0
+
+
+def test_flipped_prediction_is_caught():
+    ref = _logits([[5.0, 4.9, 0.0]])
+    cand = _logits([[4.9, 5.0, 0.0]])
+    r = compare_logits(ref, cand)
+    assert r.top1_agreement == 0.0
+    # Still in the candidate's top 5, so the softer check does not fire --
+    # which is the distinction the two metrics exist to draw.
+    assert r.top5_agreement == 1.0
+
+
+def test_top5_agreement_fails_when_the_class_falls_out_of_range():
+    ref = _logits([[9.0] + [0.0] * 9])  # reference picks class 0
+    cand = _logits([[-9.0] + [float(i) for i in range(9)]])  # class 0 now last
+    r = compare_logits(ref, cand)
+    assert r.top1_agreement == 0.0
+    assert r.top5_agreement == 0.0
+
+
+def test_partial_agreement_is_a_fraction():
+    ref = _logits([[2.0, 0.0], [0.0, 2.0], [2.0, 0.0], [2.0, 0.0]])
+    cand = _logits([[2.0, 0.0], [2.0, 0.0], [2.0, 0.0], [2.0, 0.0]])
+    assert compare_logits(ref, cand).top1_agreement == 0.75
+
+
+def test_mismatched_shapes_are_rejected():
+    with pytest.raises(ValueError, match="cannot compare"):
+        compare_logits(np.zeros((2, 10), np.float32), np.zeros((2, 8), np.float32))
+
+
+def test_unbatched_logits_are_rejected():
+    with pytest.raises(ValueError, match="N, num_classes"):
+        compare_logits(np.zeros(10, np.float32), np.zeros(10, np.float32))

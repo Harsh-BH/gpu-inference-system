@@ -52,6 +52,7 @@ class FakeEngine(InferenceEngine):
             model_name="fake",
             model_version="v1",
             precision="fp32",
+            math_mode="fp32",
             device="cpu",
             input_shape=SHAPE,
             max_batch_size=self._max_batch,

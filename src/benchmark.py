@@ -78,6 +78,7 @@ class BenchmarkResult:
     model_name: str
     model_version: str
     precision: str
+    math_mode: str  # what the arithmetic ran at; fp32 and tf32 both store fp32
     device: str
     batch_size: int
     iterations: int
@@ -114,6 +115,78 @@ class BenchmarkResult:
     @property
     def p99_is_meaningful(self) -> bool:
         return self.iterations >= P99_MIN_ITERATIONS
+
+
+@dataclass(frozen=True, slots=True)
+class AgreementResult:
+    """How closely one engine's outputs match a reference engine's.
+
+    Speed without this is meaningless. A precision or runtime that is 2x faster
+    and picks a different class is not an optimisation, it is a regression with
+    good marketing.
+
+    Three levels of "agreement", reported separately because they fail in that
+    order and only the first one is usually load-bearing:
+
+      top1_agreement    the predicted class is identical. What a user sees.
+      top5_agreement    the reference's top pick is still in the candidate's
+                        top 5 -- a softer check that catches "ranking shuffled
+                        among near-ties" without calling it a failure.
+      logit drift       raw numerical distance. Degrades long before either of
+                        the above, which is exactly why neither is sufficient
+                        alone: identical top-1 with large drift means you got
+                        lucky on this dataset, not that the maths is fine.
+    """
+
+    samples: int
+    top1_agreement: float  # 0..1
+    top5_agreement: float  # 0..1
+    max_abs_logit_diff: float
+    mean_abs_logit_diff: float
+    max_confidence_delta: float  # largest post-softmax probability change
+
+    def __str__(self) -> str:
+        return (
+            f"top-1 {self.top1_agreement:.1%}  top-5 {self.top5_agreement:.1%}  "
+            f"max|dlogit| {self.max_abs_logit_diff:.2e}  "
+            f"max dconf {self.max_confidence_delta:.2e}"
+        )
+
+
+def compare_logits(reference: np.ndarray, candidate: np.ndarray) -> AgreementResult:
+    """Compare two engines' raw outputs on identical input.
+
+    A pure function over arrays rather than over engines, so it needs no GPU,
+    is testable directly, and gets reused unchanged when Phases 7 and 9 compare
+    ONNX Runtime and TensorRT against the PyTorch baseline.
+    """
+    if reference.shape != candidate.shape:
+        raise ValueError(f"cannot compare logits of shape {reference.shape} and {candidate.shape}")
+    if reference.ndim != 2:
+        raise ValueError(f"expected (N, num_classes), got {reference.shape}")
+
+    from src.postprocessing.classification import softmax
+
+    ref_top1 = reference.argmax(axis=1)
+    cand_top1 = candidate.argmax(axis=1)
+
+    k = min(5, candidate.shape[1])
+    cand_top5 = np.argpartition(candidate, -k, axis=1)[:, -k:]
+    in_top5 = np.array([ref_top1[i] in cand_top5[i] for i in range(reference.shape[0])], dtype=bool)
+
+    diff = np.abs(reference.astype(np.float64) - candidate.astype(np.float64))
+    conf_delta = np.abs(
+        softmax(reference).astype(np.float64) - softmax(candidate).astype(np.float64)
+    )
+
+    return AgreementResult(
+        samples=int(reference.shape[0]),
+        top1_agreement=float((ref_top1 == cand_top1).mean()),
+        top5_agreement=float(in_top5.mean()),
+        max_abs_logit_diff=float(diff.max()),
+        mean_abs_logit_diff=float(diff.mean()),
+        max_confidence_delta=float(conf_delta.max()),
+    )
 
 
 def _percentiles(samples: np.ndarray) -> dict[str, float]:
@@ -175,6 +248,7 @@ def benchmark_engine(
         model_name=meta.model_name,
         model_version=meta.model_version,
         precision=meta.precision,
+        math_mode=meta.math_mode,
         device=meta.device,
         batch_size=batch_size,
         iterations=iterations,
