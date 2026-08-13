@@ -169,9 +169,7 @@ class InferenceEngine(ABC):
         cannot be forgotten.
         """
         if not self.is_loaded:
-            raise EngineNotLoadedError(
-                f"{type(self).__name__}.predict() called before load()"
-            )
+            raise EngineNotLoadedError(f"{type(self).__name__}.predict() called before load()")
         self._validate_batch(batch)
         return self._predict(batch)
 
@@ -211,9 +209,7 @@ class InferenceEngine(ABC):
         if not isinstance(batch, np.ndarray):
             raise EngineError(f"batch must be np.ndarray, got {type(batch).__name__}")
         if batch.ndim != 4:
-            raise EngineError(
-                f"batch must be 4-D (N, C, H, W), got {batch.ndim}-D {batch.shape}"
-            )
+            raise EngineError(f"batch must be 4-D (N, C, H, W), got {batch.ndim}-D {batch.shape}")
         expected = meta.input_shape
         if batch.shape[1:] != expected:
             raise EngineError(

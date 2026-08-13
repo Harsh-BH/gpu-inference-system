@@ -77,6 +77,28 @@ class Settings(BaseSettings):
     precision: Precision = Precision.FP32
     device: str = "cuda:0"
 
+    # TF32: the silent precision change nobody asks for.
+    #
+    # On Ampere and later, PyTorch defaults torch.backends.cudnn.allow_tf32 to
+    # True. Convolutions then run on Tensor Cores in TF32 -- 8 exponent bits
+    # like FP32, but only 10 mantissa bits instead of 23. Tensors are still
+    # float32 in memory; the *accumulation* is not. Nothing announces this.
+    #
+    # Measured on this box (RTX 3050, ResNet-18, max |gpu - cpu| on logits):
+    #     TF32 on  ->  3.56e-03      (PyTorch's default)
+    #     TF32 off ->  5.25e-06      (true FP32)
+    # A 680x difference in numerical agreement, from a flag we never set.
+    #
+    # That is unusable as a baseline. Phases 5, 7 and 9 all measure runtimes
+    # against "PyTorch FP32", and if that baseline is quietly TF32 then every
+    # accuracy delta attributed to ONNX Runtime or TensorRT is partly just this.
+    #
+    # So it defaults to False -- honest FP32 -- and is exposed as a knob rather
+    # than a default, because "do not silently convert the model" has to apply
+    # to the framework's silent conversions too, not only to ours. Turning it
+    # on is a legitimate production choice and Phase 5 benchmarks it as one.
+    allow_tf32: bool = False
+
     # --- Preprocessing --------------------------------------------------
     image_size: int = Field(default=224, ge=32, le=1024)
 
