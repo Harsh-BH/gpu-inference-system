@@ -163,6 +163,33 @@ operator, and back. It wins 1.8× *while* wasting a quarter of its time shufflin
 Eliminating that is what TensorRT's whole-graph layout planning does, which gives Phase 8
 a concrete target rather than a hope.
 
+### ONNX Runtime is not faster than PyTorch here
+
+`uv run python scripts/benchmark_backends.py`
+
+| batch | pytorch | onnxruntime | ratio |
+|---|---|---|---|
+| 1 | 275.5 img/s | 303.0 img/s | 1.10× |
+| 8 | 572.2 img/s | 568.0 img/s | 0.99× |
+| 16 | 657.8 img/s | 674.6 img/s | 1.03× |
+| 32 | 644.0 img/s | 649.5 img/s | 1.01× |
+
+Indistinguishable at batch ≥ 8, and the batch-1 edge collapses to 1.06×/1.04×/1.02× when
+re-run in isolation. ORT also uses *more* device VRAM (595 vs 523 MiB at batch 32).
+Agreement with PyTorch is exact where it counts: top-1 100%, max |Δlogit| 1.43e-05.
+
+That's explainable, not surprising. ORT's advantage is whole-graph optimisation — but the
+export had already folded all 20 BatchNorms, so its biggest win was pre-applied. What's
+left is 51 convolution-dominated nodes that both runtimes hand to the same cuDNN kernels.
+Graph fusion pays on many small ops (transformer blocks), not on a plain convnet.
+
+**The bug this phase nearly shipped with.** `get_available_providers()` listed
+`CUDAExecutionProvider`, but the session silently ran on `CPUExecutionProvider` —
+`libonnxruntime_providers_cuda.so` couldn't `dlopen` `libcublasLt.so.13`. No exception.
+Correct answers, ~10× slower. Every "ONNX Runtime CUDA" number here would have been a CPU
+number. `load()` now verifies the provider it got against the one it asked for, and
+preloads torch's bundled CUDA libraries so ORT can find them.
+
 ## Layout
 
 ```

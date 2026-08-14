@@ -597,16 +597,140 @@ optimisation for nothing.
 
 ---
 
+## Experiment 12 — ONNX Runtime silently ran on the CPU
+
+**Hypothesis.** `onnxruntime-gpu` is installed and
+`ort.get_available_providers()` lists `CUDAExecutionProvider`, so requesting it
+gives GPU execution.
+
+**Setup.** Create an `InferenceSession` with
+`providers=[("CUDAExecutionProvider", {"device_id": 0}), "CPUExecutionProvider"]`
+and inspect `session.get_providers()` — what was actually registered, as
+opposed to what is theoretically available.
+
+**Measurement.**
+
+```
+ort.get_available_providers()  ->  ['TensorrtExecutionProvider',
+                                    'CUDAExecutionProvider',
+                                    'CPUExecutionProvider']
+session.get_providers()        ->  ['CPUExecutionProvider']
+
+[E:onnxruntime] Failed to load library libonnxruntime_providers_cuda.so
+                with error: libcublasLt.so.13: cannot open shared object file
+```
+
+**Result.** Hypothesis was wrong, and **no exception was raised**. The session
+was created, ran, and returned correct logits — on the CPU.
+
+**Explanation.** `get_available_providers()` reports what the build supports,
+not what can be loaded right now. ORT tries each provider in priority order and
+silently drops any that fails to initialise. Here
+`libonnxruntime_providers_cuda.so` could not `dlopen` `libcublasLt.so.13`:
+PyTorch ships its CUDA runtime inside the `nvidia-*` pip packages and loads it
+itself at import, but `site-packages` is not on the dynamic linker's search
+path, so ORT could not find the same libraries.
+
+This is the most dangerous failure in the project so far, because nothing looks
+broken. Correct answers, roughly an order of magnitude slower. Every "ONNX
+Runtime CUDA" number in this repository would have been a CPU number, and the
+Phase 9 comparison against TensorRT would have been meaningless.
+
+**Trade-off / what changed.**
+
+1. `load()` compares the provider it asked for against `get_providers()` and
+   raises `EngineNotAvailableError` if CUDA was requested and is absent.
+   Failing to start beats being slow for an invisible reason.
+2. `_preload_cuda_libraries()` `ctypes.CDLL`s the required libraries with
+   `RTLD_GLOBAL` before session creation. Once a library is in the process's
+   global symbol table the linker satisfies ORT's dependency from memory
+   instead of the filesystem — equivalent to `LD_LIBRARY_PATH` without asking
+   anyone to configure a shell.
+3. ORT's CUDA provider also has `use_tf32`, defaulting on, exactly as PyTorch
+   does. It is now driven from `ALLOW_TF32` so Experiment 2 does not repeat
+   itself on a second backend.
+
+---
+
+## Experiment 13 — PyTorch vs ONNX Runtime
+
+**Hypothesis.** ONNX Runtime loads the whole graph before running it, so it can
+fuse operators, fold constants and plan memory across the entire forward pass.
+It should beat eager PyTorch, which dispatches one operator at a time from
+Python.
+
+**Setup.** `scripts/benchmark_backends.py`, 300 iterations per (batch,
+backend), interleaved by batch size with rotated order. Same ResNet-18 weights;
+ORT consumes the Phase 6 `model.onnx`. FP32, TF32 off on both. ORT uses
+IOBinding so its stage timings are separable rather than one opaque call.
+
+**Measurement.**
+
+| batch | backend | p50 ms | img/s | torch VRAM | device VRAM | vs PyTorch |
+|---|---|---|---|---|---|---|
+| 1 | pytorch | 3.88 | 275.5 | 79.87 MiB | 337.44 MiB | 1.00× |
+| 1 | onnxruntime | 2.66 | 303.0 | 8.12 MiB | 407.44 MiB | 1.10× |
+| 8 | pytorch | 13.70 | 572.2 | 106.41 MiB | 361.44 MiB | 1.00× |
+| 8 | onnxruntime | 13.55 | 568.0 | 8.12 MiB | 413.44 MiB | 0.99× * |
+| 16 | pytorch | 24.62 | 657.8 | 162.00 MiB | 427.44 MiB | 1.00× |
+| 16 | onnxruntime | 23.39 | 674.6 | 8.12 MiB | 541.44 MiB | 1.03× * |
+| 32 | pytorch | 49.51 | 644.0 | 267.19 MiB | 523.44 MiB | 1.00× |
+| 32 | onnxruntime | 49.27 | 649.5 | 8.12 MiB | 595.44 MiB | 1.01× * |
+
+`*` within the 5% noise floor.
+
+Batch 1 re-run three times in isolation: **1.06×, 1.04×, 1.02×**.
+
+Agreement: top-1 100%, top-5 100%, max |Δlogit| **1.43e-05**.
+
+**Result.** Hypothesis was wrong. **ONNX Runtime is not faster than eager
+PyTorch on this model** — indistinguishable at batch ≥ 8, and the batch-1 edge
+collapses to the noise floor on repetition. It also uses *more* device VRAM
+(595 vs 523 MiB at batch 32).
+
+**Explanation.** ORT's structural advantage is whole-graph optimisation, and
+most of it was already spent. Experiment 11 showed the export had already
+folded all 20 BatchNorm layers into their convolutions, so the largest fusion
+win was applied before ORT ever saw the file. What remains is 51 nodes
+dominated by convolution, and both runtimes hand those to the same cuDNN
+kernels with the same algorithm choices.
+
+Graph-level optimisation pays where there are many small operators to fuse and
+much intermediate memory to plan — transformer blocks with LayerNorm/GELU
+chains, or models with heavy elementwise tails. A plain convnet at batch ≥ 8 is
+neither: it is compute-bound inside a handful of large convolutions, and there
+is nothing left to arrange around them.
+
+The batch-1 edge, such as it is, is consistent with this: at batch 1 the GPU
+work is small enough that PyTorch's per-operator Python dispatch is measurable,
+and ORT runs its plan without Python in the loop. By batch 8 that overhead is
+amortised into irrelevance.
+
+**Trade-off.** ONNX Runtime earns its place here for portability and as the
+step that produces a graph TensorRT can compile — not for speed. The honest
+statement is that on this model it costs ~70 MiB more VRAM for no measurable
+throughput gain. Whether TensorRT does better is Phase 9's question, and
+Experiment 10 already identified the target it has to attack: the 22.4% of GPU
+time FP16 spends on NCHW↔NHWC layout conversion.
+
+One measurement note: `torch VRAM` reads a constant 8.12 MiB for ORT at every
+batch size, because `torch.cuda.max_memory_allocated()` only sees PyTorch's
+allocator — that 8.12 MiB is torch's own cuBLAS workspace from Experiment 6,
+not anything ORT allocated. `BenchmarkResult` gained `device_used_bytes` from
+the driver's total-minus-free, which is the only VRAM figure comparable across
+backends.
+
+---
+
 ## Pending
 
 | # | Experiment | Phase |
 |---|---|---|
-| 12 | PyTorch vs ONNX Runtime | 7 |
-| 13 | ONNX Runtime vs TensorRT | 9 |
-| 14 | Static vs dynamic batching | 11 |
-| 15 | Cold start vs warm inference | 13 |
-| 16 | Concurrent users | 12 |
-| 17 | CUDA streams | 18 |
-| 18 | Pinned memory and non-blocking transfer | 19 |
-| 19 | CUDA Graphs | 20 |
-| 20 | INT8 quantisation | 21 |
+| 14 | ONNX Runtime vs TensorRT | 9 |
+| 15 | Static vs dynamic batching | 11 |
+| 16 | Cold start vs warm inference | 13 |
+| 17 | Concurrent users | 12 |
+| 18 | CUDA streams | 18 |
+| 19 | Pinned memory and non-blocking transfer | 19 |
+| 20 | CUDA Graphs | 20 |
+| 21 | INT8 quantisation | 21 |
