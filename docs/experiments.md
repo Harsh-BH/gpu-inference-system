@@ -913,7 +913,101 @@ For this model FP16 is the better operating point, and that is the finding.
 
 ---
 
+## Experiment 18 — Static vs dynamic batching (Phase 11)
+
+**Hypothesis.** Batching trades latency for throughput. Dynamic batching should
+raise throughput and *raise* p99, exactly as the batch-size sweep in
+Experiment 7 showed.
+
+**Setup.** Live server, TensorRT FP16, 16 preprocessing workers, 25 concurrent
+clients, 200 requests per configuration. `MAX_BATCH_SIZE=1` is "no batching" —
+every request becomes its own GPU call.
+
+**Measurement.**
+
+| configuration | req/s | p50 ms | p95 ms | p99 ms | server queue p50 |
+|---|---|---|---|---|---|
+| no batching (size 1) | 165.6 | 139.3 | 255.6 | 295.0 | 96.1 ms |
+| **dynamic size 8, wait 5 ms** | **197.1** | **120.4** | **157.5** | **177.9** | 19.2 ms |
+| dynamic size 16, wait 5 ms | 189.9 | 123.3 | 173.5 | 194.7 | 27.9 ms |
+| dynamic size 16, wait 20 ms | 186.7 | 127.3 | 189.4 | 193.7 | 38.1 ms |
+
+**Result.** Hypothesis was wrong, and instructively so. Dynamic batching won on
+**both** axes: **+19% throughput and −40% p99** (295.0 → 177.9 ms).
+
+**Explanation.** Experiment 7 measured batch latency *in isolation*, with no
+queue — there, a batch of 16 genuinely costs 9.2× the latency of a batch of 1.
+Under concurrency the picture inverts, because the dominant term is no longer
+the GPU call, it is **waiting for the GPU to become free**.
+
+With no batching, 25 concurrent requests are 25 sequential GPU calls, and the
+queue-wait column shows the consequence: 96.1 ms of pure waiting. Batching eight
+of them into one call drains the queue roughly eight times faster, and queue
+wait collapses to 19.2 ms. The batch call itself is slower; every request still
+finishes sooner.
+
+So the textbook line "batching increases latency" is only true of an **idle**
+system, where you wait for a batch that will never fill. On a loaded one,
+batching is a latency optimisation.
+
+**Trade-off.** The remaining rows show the other edge. Size 16 is slightly worse
+than size 8, and a 20 ms deadline is worse than 5 ms — queue wait climbs
+19.2 → 27.9 → 38.1 ms. Both are the same cause: preprocessing (Experiment 15)
+cannot supply images fast enough to fill a batch of 16, so the extra capacity
+and the longer deadline are paid for and never used. Batch parameters have to
+be tuned against the stage that actually feeds them.
+
+---
+
+## Experiment 19 — Cold start vs warm inference (Phase 13)
+
+**Hypothesis.** The first request after startup is slower than steady state,
+enough to justify warming up before reporting ready.
+
+**Setup.** `scripts/cold_start.py`. Each backend measured in its **own fresh
+process** — the CUDA context is per-process and survives engine teardown, so a
+second backend in a shared process would report a cold start that is not cold.
+
+**Measurement.**
+
+| backend | load | 1st inference | 2nd inference | warm p50 | cold penalty |
+|---|---|---|---|---|---|
+| pytorch | 2399 ms | 227.3 ms | 3.2 ms | 3.74 ms | **61×** |
+| onnxruntime | 3907 ms | 408.4 ms | 5.1 ms | 3.60 ms | **113×** |
+| tensorrt | 1997 ms | 79.4 ms | 2.5 ms | 2.17 ms | **37×** |
+
+**Result.** Confirmed, and larger than expected. ONNX Runtime's first inference
+costs **113× its warm latency**, and the full cold path — load plus first
+inference — is 4315 ms before it can answer at all.
+
+**Explanation.** None of that is the model's arithmetic. `load()` reads weights
+and moves them into VRAM; the first `predict()` pays lazy CUDA context creation
+(104.81 MiB, Experiment 4), kernel module loading, cuDNN algorithm selection for
+this input shape, and allocator growth.
+
+The second inference is already near-warm (2.5–5.1 ms), so almost the entire
+penalty lands on exactly one request.
+
+TensorRT has the cheapest cold path of the three, which is the flip side of its
+expensive build: kernel selection happened at compile time, so there is far less
+left to discover at first use. ONNX Runtime is the most expensive because its
+CUDA provider does an exhaustive convolution-algorithm search on first
+encounter with a shape.
+
+**Trade-off.** Warmup does not remove this cost, it moves it. `WARMUP_REQUESTS`
+adds ~0.1–0.5 s to startup and the server does not report ready until it is
+done — which is precisely the point of ordering the lifespan as load → warmup →
+ready. The cost exists either way; the only decision is whether the server pays
+it at boot or a user pays it in production.
+
+One consequence worth noting for dynamic batching: cuDNN caches its algorithm
+choice **per input shape**, so warming at batch 1 does not warm batch 8. A
+server that batches will still pay a smaller version of this the first time it
+sees each new batch size.
+
+---
+
 ## Pending
 
-Nothing. All 17 experiments are recorded above.
+Nothing. All 19 experiments are recorded above.
 

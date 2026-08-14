@@ -181,10 +181,18 @@ at batch 1 to 1.438 at batch 16.
 
 ### 24. Why can batching increase latency?
 
-Because every image waits for the whole batch. Measured: batch 1 is 2.50 ms p50
-and 332 img/s; batch 16 is 23.01 ms p50 and 703 img/s. **2.1× the throughput
-for 9.2× the latency.** Plus every request pays up to `MAX_BATCH_WAIT_MS` even
-when there is nobody to batch with.
+Because every image waits for the whole batch. Measured in isolation: batch 1 is
+2.50 ms p50 and 332 img/s; batch 16 is 23.01 ms p50 and 703 img/s — **2.1× the
+throughput for 9.2× the latency.** Plus every request pays up to
+`MAX_BATCH_WAIT_MS` even when there is nobody to batch with.
+
+**But that is only true of an idle system, and it is worth saying so.** Measured
+on a loaded server at 25 concurrent clients, dynamic batching *improved* both:
+165.6 → 197.1 req/s **and** p99 295.0 → 177.9 ms. Once requests are queueing,
+the dominant term is waiting for the GPU to be free, not the GPU call itself.
+Batching eight requests into one call drains the queue roughly eight times
+faster — queue wait fell 96.1 → 19.2 ms. The batch call is slower and every
+request still finishes sooner.
 
 ### 25. What causes CUDA OOM?
 

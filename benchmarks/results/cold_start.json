@@ -1,0 +1,26 @@
+[
+  {
+    "backend": "pytorch",
+    "precision": "fp32",
+    "load_ms": 2399.2191169963917,
+    "first_inference_ms": 227.2792279982241,
+    "second_inference_ms": 3.169551993778441,
+    "warm_median_ms": 3.7365229982242454
+  },
+  {
+    "backend": "onnxruntime",
+    "precision": "fp32",
+    "load_ms": 3907.0511989993975,
+    "first_inference_ms": 408.43938600301044,
+    "second_inference_ms": 5.06356999540003,
+    "warm_median_ms": 3.599318501073867
+  },
+  {
+    "backend": "tensorrt",
+    "precision": "fp32",
+    "load_ms": 1996.8028939983924,
+    "first_inference_ms": 79.3835649965331,
+    "second_inference_ms": 2.5415900017833337,
+    "warm_median_ms": 2.1652369941875804
+  }
+]
