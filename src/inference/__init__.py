@@ -52,9 +52,9 @@ def create_engine(settings: Settings) -> InferenceEngine:
             return ONNXRuntimeEngine(settings)
 
         case Backend.TENSORRT:
-            raise EngineNotAvailableError(
-                "the tensorrt backend is not implemented yet (Phase 8). Use BACKEND=pytorch."
-            )
+            from src.inference.tensorrt_engine import TensorRTEngine
+
+            return TensorRTEngine(settings)
 
         case _:  # unreachable: Settings validates the enum at parse time
             raise EngineNotAvailableError(f"unknown backend {settings.backend!r}")

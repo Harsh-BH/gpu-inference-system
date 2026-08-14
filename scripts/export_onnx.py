@@ -65,11 +65,14 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from src.config import Settings
-from src.model.pytorch_model import ModelArtifactError, load_from_repository
+from src.config import Precision, Settings
+from src.model.pytorch_model import (
+    ModelArtifactError,
+    load_from_repository,
+    onnx_filename,
+)
 from src.utils.tensor_info import human_bytes
 
-ONNX_FILE = "model.onnx"
 INPUT_NAME = "input"
 OUTPUT_NAME = "logits"
 
@@ -78,7 +81,14 @@ def section(title: str) -> None:
     print(f"\n\033[1m{title}\033[0m")
 
 
-def export(model: torch.nn.Module, path: Path, image_size: int, opset: int, max_batch: int):
+def export(
+    model: torch.nn.Module,
+    path: Path,
+    image_size: int,
+    opset: int,
+    max_batch: int,
+    precision: str = "fp32",
+):
     """Trace the module and write the graph.
 
     Exported on CPU in FP32 deliberately. The ONNX file is the *portable*
@@ -87,8 +97,15 @@ def export(model: torch.nn.Module, path: Path, image_size: int, opset: int, max_
     mean re-exporting for every combination, and would make Phase 9's
     comparison test different graphs rather than different runtimes.
     """
-    model = model.eval().cpu()
-    example = torch.zeros(1, 3, image_size, image_size, dtype=torch.float32)
+    if precision == "fp16":
+        # Traced in FP16 on the GPU, because the *graph* has to be FP16 -- see
+        # onnx_filename(). Half-precision convolution has no CPU kernel path,
+        # so tracing on the CPU would fail or silently upcast.
+        model = model.eval().half().cuda()
+        example = torch.zeros(1, 3, image_size, image_size, dtype=torch.float16, device="cuda")
+    else:
+        model = model.eval().cpu()
+        example = torch.zeros(1, 3, image_size, image_size, dtype=torch.float32)
 
     # torch 2.13 defaults to the dynamo exporter, which traces via torch.export
     # rather than TorchScript. Dim() declares which axis may vary and over what
@@ -218,7 +235,11 @@ def describe_graph(path: Path, requested_opset: int, torch_model: torch.nn.Modul
     return opset_matches
 
 
-def validate(path: Path) -> bool:
+def _np_dtype(precision: str):
+    return np.float16 if precision == "fp16" else np.float32
+
+
+def validate(path: Path, precision: str = "fp32") -> bool:
     """Structural validation with ONNX's own checker."""
     import onnx
 
@@ -240,13 +261,22 @@ def validate(path: Path) -> bool:
         print("  install with: uv sync --extra onnx")
         return True
 
-    session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
-    got = session.run(None, {INPUT_NAME: np.zeros((1, 3, 224, 224), dtype=np.float32)})[0]
+    providers = ["CPUExecutionProvider"]
+    if precision == "fp16":
+        # No CPU kernels for half-precision convolution, so validate on CUDA.
+        from src.inference.onnx_engine import _preload_cuda_libraries
+
+        _preload_cuda_libraries()
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    session = ort.InferenceSession(str(path), providers=providers)
+    got = session.run(None, {INPUT_NAME: np.zeros((1, 3, 224, 224), dtype=_np_dtype(precision))})[0]
     print(f"  onnxruntime CPU run       ok, output {got.shape} {got.dtype}")
     return True
 
 
-def check_numerical_equivalence(path: Path, model: torch.nn.Module, image_size: int) -> bool:
+def check_numerical_equivalence(
+    path: Path, model: torch.nn.Module, image_size: int, precision: str = "fp32"
+) -> bool:
     """Does the exported graph compute what the PyTorch model computes?
 
     The check that actually matters. `check_model` verifies the file is
@@ -265,15 +295,26 @@ def check_numerical_equivalence(path: Path, model: torch.nn.Module, image_size: 
     rng = np.random.default_rng(0)
     data = rng.standard_normal((4, 3, image_size, image_size), dtype=np.float32)
 
+    # Reference is always FP32 PyTorch on the CPU. Comparing an FP16 graph
+    # against an FP16 reference would only prove they agree with each other.
     with torch.inference_mode():
-        expected = model.eval().cpu()(torch.from_numpy(data)).numpy()
+        expected = model.eval().float().cpu()(torch.from_numpy(data)).numpy()
 
-    session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
-    got = session.run(None, {INPUT_NAME: data})[0]
+    providers = ["CPUExecutionProvider"]
+    if precision == "fp16":
+        from src.inference.onnx_engine import _preload_cuda_libraries
 
-    agreement = compare_logits(expected, got)
+        _preload_cuda_libraries()
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    session = ort.InferenceSession(str(path), providers=providers)
+    got = session.run(None, {INPUT_NAME: data.astype(_np_dtype(precision))})[0]
+
+    agreement = compare_logits(expected, got.astype(np.float32))
     print(f"  {agreement}")
-    ok = agreement.top1_agreement == 1.0 and agreement.max_abs_logit_diff < 1e-4
+    # FP16 has ~3 decimal digits of mantissa, so a tolerance of 1e-4 would be
+    # asserting something arithmetically impossible. Top-1 must still hold.
+    tolerance = 0.1 if precision == "fp16" else 1e-4
+    ok = agreement.top1_agreement == 1.0 and agreement.max_abs_logit_diff < tolerance
     print(
         "  export preserves the model's semantics"
         if ok
@@ -282,7 +323,9 @@ def check_numerical_equivalence(path: Path, model: torch.nn.Module, image_size: 
     return ok
 
 
-def check_dynamic_batch(path: Path, image_size: int, sizes=(1, 3, 8)) -> bool:
+def check_dynamic_batch(
+    path: Path, image_size: int, sizes=(1, 3, 8), precision: str = "fp32"
+) -> bool:
     """Prove the symbolic dimension actually accepts varying batch sizes.
 
     The export declaring a dynamic axis and the graph accepting one are two
@@ -292,10 +335,13 @@ def check_dynamic_batch(path: Path, image_size: int, sizes=(1, 3, 8)) -> bool:
     import onnxruntime as ort
 
     section("Dynamic batch")
-    session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    providers = ["CPUExecutionProvider"]
+    if precision == "fp16":
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    session = ort.InferenceSession(str(path), providers=providers)
     ok = True
     for n in sizes:
-        data = np.zeros((n, 3, image_size, image_size), dtype=np.float32)
+        data = np.zeros((n, 3, image_size, image_size), dtype=_np_dtype(precision))
         try:
             out = session.run(None, {INPUT_NAME: data})[0]
             print(f"  batch {n:>2}  ->  logits {out.shape}")
@@ -324,11 +370,18 @@ def main() -> int:
         default=64,
         help="upper bound declared for the dynamic batch dimension",
     )
+    ap.add_argument(
+        "--precision",
+        choices=[p.value for p in Precision],
+        default="fp32",
+        help="fp16 produces a separate model.fp16.onnx; TensorRT 11 and ORT both "
+        "take precision from the graph, not from a runtime flag",
+    )
     ap.add_argument("--force", action="store_true", help="overwrite an existing model.onnx")
     args = ap.parse_args()
 
     model_dir = settings.model_repository / args.name / args.version
-    path = model_dir / ONNX_FILE
+    path = model_dir / onnx_filename(args.precision)
 
     if path.is_file() and not args.force:
         print(f"{path} already exists (use --force to re-export)")
@@ -342,10 +395,16 @@ def main() -> int:
 
     model_dir.mkdir(parents=True, exist_ok=True)
     print(f"\n\033[1mExporting\033[0m {args.name} {args.version} -> {path}")
-    print(f"  opset {args.opset}, batch dimension dynamic in [1, {args.max_batch}]")
+    print(
+        f"  opset {args.opset}, {args.precision}, batch dimension dynamic in [1, {args.max_batch}]"
+    )
+
+    if args.precision == "fp16" and not torch.cuda.is_available():
+        print("error: fp16 export needs a CUDA device to trace on", file=sys.stderr)
+        return 1
 
     try:
-        export(model, path, settings.image_size, args.opset, args.max_batch)
+        export(model, path, settings.image_size, args.opset, args.max_batch, args.precision)
     except Exception as exc:
         # PRD failure case: export failure must be a clear message, not a
         # traceback ending in the middle of a tracer.
@@ -354,9 +413,9 @@ def main() -> int:
 
     ok = describe_graph(path, args.opset, model)
 
-    ok &= validate(path)
-    ok &= check_numerical_equivalence(path, model, settings.image_size)
-    ok &= check_dynamic_batch(path, settings.image_size)
+    ok &= validate(path, args.precision)
+    ok &= check_numerical_equivalence(path, model, settings.image_size, args.precision)
+    ok &= check_dynamic_batch(path, settings.image_size, precision=args.precision)
 
     if ok:
         print(f"\n\033[32mExported and verified: {path}\033[0m\n")

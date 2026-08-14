@@ -50,7 +50,7 @@ from time import perf_counter
 
 import numpy as np
 
-from src.config import Precision, Settings
+from src.config import Settings
 from src.inference.base import (
     EngineError,
     EngineMetadata,
@@ -59,8 +59,7 @@ from src.inference.base import (
     InferenceResult,
     StageTimings,
 )
-
-ONNX_FILE = "model.onnx"
+from src.model.pytorch_model import onnx_filename
 
 # Loaded before the CUDA provider so its dlopen resolves. See _preload_cuda_libraries.
 _CUDA_SONAMES = (
@@ -129,6 +128,7 @@ class ONNXRuntimeEngine(InferenceEngine):
         self._input_name = ""
         self._output_name = ""
         self._num_classes = 0
+        self._input_dtype = np.float32
         self._preloaded_libs: list[str] = []
 
     # --- lifecycle ------------------------------------------------------
@@ -142,21 +142,14 @@ class ONNXRuntimeEngine(InferenceEngine):
                 "onnxruntime is not installed. Run: uv sync --extra onnx"
             ) from exc
 
-        if s.precision is Precision.FP16:
-            # Honest limitation rather than a silent fp32 run. ORT does not
-            # convert precision at load time the way PyTorch's .half() does --
-            # an FP16 ONNX graph is a different file, produced by a conversion
-            # pass. Not built yet; see docs/experiments.md.
-            raise EngineNotAvailableError(
-                "the onnxruntime backend currently supports PRECISION=fp32 only. "
-                "ORT needs a separately converted FP16 graph (model.fp16.onnx), "
-                "which this project has not built yet."
-            )
-
-        path = s.model_dir / ONNX_FILE
+        # Precision is a property of the graph, not a runtime switch: ORT never
+        # converts at load time. FP16 means loading a different file.
+        path = s.model_dir / onnx_filename(s.precision.value)
         if not path.is_file():
             raise EngineNotAvailableError(
-                f"no ONNX model at {path}\n  run: uv run python scripts/export_onnx.py"
+                f"no ONNX model at {path}\n"
+                f"  run: uv run python scripts/export_onnx.py "
+                f"--precision {s.precision.value}"
             )
 
         providers: list = []
@@ -217,6 +210,7 @@ class ONNXRuntimeEngine(InferenceEngine):
             )
         self._input_name = inputs[0].name
         self._output_name = outputs[0].name
+        self._input_dtype = np.float16 if "float16" in inputs[0].type else np.float32
 
         shape = inputs[0].shape  # e.g. ['batch', 3, 224, 224]
         if len(shape) != 4:
@@ -270,6 +264,12 @@ class ONNXRuntimeEngine(InferenceEngine):
 
         assert self._session is not None
         s = self._settings
+
+        if self._input_dtype != batch.dtype:
+            # Cast to whatever the graph declares. The engine interface is
+            # always float32 so backends stay interchangeable and comparable;
+            # the conversion belongs here, not in the caller.
+            batch = batch.astype(self._input_dtype)
 
         if not s.is_cuda:
             # No device, no transfers to attribute. session.run does everything.

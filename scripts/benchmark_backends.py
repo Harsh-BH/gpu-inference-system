@@ -41,10 +41,17 @@ from src.utils.tensor_info import human_bytes
 SAMPLE_IMAGE = Path("data/dog.jpg")
 EVAL_SAMPLES = 32
 
-CONFIGS = [
+# The five rows Phase 9 asks for. Every one is the same ResNet-18 weights; the
+# only thing that varies is the runtime and the precision it was compiled for.
+ALL_CONFIGS = [
     EngineConfig("pytorch/fp32", Backend.PYTORCH, Precision.FP32),
+    EngineConfig("pytorch/fp16", Backend.PYTORCH, Precision.FP16),
     EngineConfig("onnxruntime/fp32", Backend.ONNXRUNTIME, Precision.FP32),
+    EngineConfig("onnxruntime/fp16", Backend.ONNXRUNTIME, Precision.FP16),
+    EngineConfig("tensorrt/fp32", Backend.TENSORRT, Precision.FP32),
+    EngineConfig("tensorrt/fp16", Backend.TENSORRT, Precision.FP16),
 ]
+CONFIGS = ALL_CONFIGS
 BASELINE = "pytorch/fp32"
 
 
@@ -164,7 +171,22 @@ def main() -> int:
     ap.add_argument("--warmup", type=int, default=20)
     ap.add_argument("--device", default=None)
     ap.add_argument("--output-dir", type=Path, default=Path("benchmarks/results"))
+    ap.add_argument(
+        "--configs",
+        default="",
+        help="comma-separated subset, e.g. pytorch/fp32,tensorrt/fp16 (default: all)",
+    )
+    ap.add_argument("--name", default="backends", help="output file stem")
     args = ap.parse_args()
+
+    global CONFIGS
+    if args.configs:
+        wanted = {c.strip() for c in args.configs.split(",")}
+        unknown = wanted - {c.label for c in ALL_CONFIGS}
+        if unknown:
+            print(f"error: unknown configs {sorted(unknown)}", file=sys.stderr)
+            return 2
+        CONFIGS = [c for c in ALL_CONFIGS if c.label in wanted]
 
     try:
         batch_sizes = [int(b) for b in args.batch_sizes.split(",") if b.strip()]
@@ -199,7 +221,7 @@ def main() -> int:
     report_performance(results)
     report_stage_breakdown(results, max(batch_sizes))
 
-    paths = write_results(results, args.output_dir, "backends")
+    paths = write_results(results, args.output_dir, args.name)
     print("\n  wrote " + "  ".join(str(p) for p in paths))
     return 0
 

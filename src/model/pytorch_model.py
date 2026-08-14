@@ -35,6 +35,21 @@ from torchvision import models
 
 WEIGHTS_FILE = "weights.pth"
 LABELS_FILE = "labels.json"
+ONNX_FILE = "model.onnx"
+ONNX_FP16_FILE = "model.fp16.onnx"
+
+
+def onnx_filename(precision: str) -> str:
+    """Which ONNX graph corresponds to a precision.
+
+    FP16 is a *different file*, not a runtime flag. TensorRT 11 only builds
+    strongly-typed networks -- it takes precision from the graph's own dtypes
+    and no longer accepts BuilderFlag.FP16 -- and ONNX Runtime never converted
+    precision at load time either. One graph per precision is therefore the
+    only honest model, and naming it in one place stops the exporter and the
+    two runtimes from disagreeing about where it lives.
+    """
+    return ONNX_FP16_FILE if precision == "fp16" else ONNX_FILE
 
 
 @dataclass(frozen=True, slots=True)

@@ -71,12 +71,32 @@ def test_missing_onnx_file_points_at_the_fix(tmp_path):
         engine.load()
 
 
-def test_fp16_is_refused_rather_than_silently_run_as_fp32(exported):
-    # ORT does not convert precision at load the way torch's .half() does.
-    # Quietly running fp32 while the report says fp16 is the failure this
-    # project exists to prevent, so the limitation is explicit.
+def test_fp16_loads_a_different_graph_not_a_flag(exported):
+    """ORT never converts precision at load; FP16 is a separate artifact.
+
+    Was previously asserted as a refusal. Phase 8 built model.fp16.onnx
+    (TensorRT 11 forced the issue by removing BuilderFlag.FP16), so the
+    correct assertion is now that the fp16 engine resolves to the fp16 file.
+    """
+    fp16_path = exported.model_dir / "model.fp16.onnx"
+    if not fp16_path.is_file():
+        pytest.skip("no model.fp16.onnx: export_onnx.py --precision fp16")
+
     engine = ONNXRuntimeEngine(settings(precision=Precision.FP16))
-    with pytest.raises(EngineNotAvailableError, match="fp32 only"):
+    engine.load()
+    try:
+        # The graph declares fp16; the engine casts for it so the interface
+        # contract (float32 in, float32 out) still holds for callers.
+        assert engine._input_dtype == np.float16
+        out = engine.predict(np.zeros((1, 3, 224, 224), dtype=np.float32))
+        assert out.logits.dtype == np.float32
+    finally:
+        engine.unload()
+
+
+def test_missing_fp16_graph_names_the_export_command(tmp_path):
+    engine = ONNXRuntimeEngine(settings(model_repository=tmp_path, precision=Precision.FP16))
+    with pytest.raises(EngineNotAvailableError, match="precision fp16"):
         engine.load()
 
 
