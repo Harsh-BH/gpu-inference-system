@@ -119,6 +119,12 @@ class Settings(BaseSettings):
     queue_max_size: int = Field(default=100, ge=1)
     request_timeout_ms: float = Field(default=10_000.0, gt=0)
 
+    # Preprocessing thread pool. Phase 4 measured one thread sustaining
+    # ~46 img/s against an engine absorbing 700-3200, so a single worker would
+    # starve the GPU no matter how fast the engine is. PIL releases the GIL
+    # during decode and resize, which is why threads help here at all.
+    preprocess_workers: int = Field(default=8, ge=1, le=64)
+
     # --- Warmup ---------------------------------------------------------
     # The first inference on a fresh CUDA context pays context creation,
     # kernel module loading, cuDNN algorithm selection and allocator growth.
