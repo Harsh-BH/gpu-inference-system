@@ -42,7 +42,9 @@ rather than theoretical.
 
 ```bash
 uv sync                                     # core + PyTorch backend
-uv run python scripts/check_gpu.py          # verify the GPU stack (exits non-zero if not)
+uv sync --extra onnx --extra trt            # + ONNX Runtime and TensorRT
+
+uv run python scripts/check_gpu.py          # verify the stack (non-zero exit if not)
 uv run python scripts/fetch_model.py        # provision models/resnet18/v1/
 
 mkdir -p data && curl -sSL -o data/dog.jpg \
@@ -51,157 +53,132 @@ mkdir -p data && curl -sSL -o data/dog.jpg \
 uv run python scripts/infer.py data/dog.jpg --trace --runs 50
 ```
 
-Later phases add the optional backends:
+Optimised backends (build once, serve many times):
 
 ```bash
-uv sync --extra onnx       # ONNX Runtime
-uv sync --extra trt        # TensorRT
+uv run python scripts/export_onnx.py                      # model.onnx
+uv run python scripts/export_onnx.py --precision fp16     # model.fp16.onnx
+uv run python scripts/build_engine.py --precision fp16    # TensorRT engine
+uv run python scripts/quantize_int8.py                    # calibrated INT8 QDQ
+uv run python scripts/build_engine.py --precision int8
 ```
 
-Configuration is entirely environment-driven — see `.env.example`. No model path, device,
-batch size, or precision is hardcoded anywhere in `src/`. CLI flags override `.env`, which
-overrides the defaults in `src/config.py`.
+Serve:
 
-## First results
+```bash
+BACKEND=tensorrt PRECISION=fp16 MAX_BATCH_SIZE=16 PREPROCESS_WORKERS=16 \
+  uv run uvicorn src.main:app --port 8000
 
-Batch 1, FP32, median of 50 warm runs. Full write-ups in [docs/experiments.md](docs/experiments.md).
-
-```
-preprocess       17.770 ms   <- CPU: JPEG decode, resize, crop, normalise
-host -> device    0.227 ms
-inference         2.982 ms   <- GPU
-device -> host    0.062 ms
-postprocess       0.109 ms
+curl -F file=@data/dog.jpg http://localhost:8000/predict
+curl http://localhost:8000/ready
+curl http://localhost:8000/metrics
 ```
 
-Three findings already worth the build:
+Configuration is entirely environment-driven — see `.env.example`. No model
+path, device, batch size or precision is hardcoded anywhere in `src/`.
 
-**The GPU is not the bottleneck.** Preprocessing costs ~6x the inference it feeds. Against
-a CPU-only run the GPU is 5.4x faster *at the model* but only 1.85x faster *at the request*
-— Amdahl's law, measured. This is why the queue and batch manager come before TensorRT in
-the build order: optimising the 3 ms while ignoring the 18 ms would be optimising the wrong
-thing.
+## Results
 
-**`PRECISION=fp32` was not FP32.** PyTorch enables TF32 convolutions by default on Ampere,
-cutting mantissa bits from 23 to 10 while tensors still report `float32`. Measured against
-the CPU reference, the default disagreed by 3.56e-03 versus 5.25e-06 with TF32 off — 680x
-worse, silently. It is now an explicit `ALLOW_TF32` flag, defaulting to off, so the FP32
-baseline the other runtimes get compared against is genuinely FP32.
+Full write-ups, including the ones where the hypothesis was wrong, are in
+[docs/experiments.md](docs/experiments.md).
 
-**Naive GPU timing lies by ~89x.** The same matmul reports 0.065 ms without
-`torch.cuda.synchronize()` and 5.723 ms with it, because kernel launches are asynchronous.
-Every timing in this repo synchronises explicitly.
+### Backends — same weights, six ways (batch 8)
 
-### VRAM, fully accounted
-
-`uv run python scripts/gpu_memory_report.py`
-
-```
-CUDA context                104.81 MiB   before a single tensor exists
-ResNet-18 FP32 weights       44.69 MiB   (44.59 MiB predicted)
-peak, batch 1                27.05 MiB
-peak, batch 32              214.38 MiB   ~6.7 MiB marginal per image
-cuBLAS workspace              8.12 MiB   survives unload(), owned by no Python object
-```
-
-Memory is **affine, not proportional**: 1 → 32 images is 32× the work but only 7.9× the
-peak, because weights are paid once and only activations scale. The script also drives a
-deliberate OOM (batch 1024 against a 4.25 GiB cap) and shows the process serving normally
-afterwards — the allocator is capped with `set_per_process_memory_fraction` rather than
-exhausting physical VRAM, since this GPU also drives the display.
-
-### Batching: better until the accelerator is full
-
-`uv run python scripts/benchmark.py --iterations 500`
-
-| batch | p50 ms | img/s | ms/img | peak VRAM | SM clock |
-|---|---|---|---|---|---|
-| 1 | 2.50 | 331.7 | 2.505 | 79.87 MiB | 1800 MHz |
-| 8 | 13.35 | 591.7 | 1.668 | 106.41 MiB | 1642 MHz |
-| **16** | **23.01** | **702.5** | **1.438** | 162.00 MiB | 1680 MHz |
-| 32 | 46.83 | 681.8 | 1.464 | 267.19 MiB | 1657 MHz |
-
-**16× the batch buys 2.1× the throughput, not 16×.** Throughput plateaus at batch 16;
-past it, batch 32 costs 2.0× the latency and 1.6× the VRAM for 0.97× the throughput.
-
-The first reading of this sweep said throughput *dropped* at batch 32. That was wrong —
-re-running the two sizes in isolation gave 662.9 and 665.2 img/s, indistinguishable. This
-is a 60 W laptop GPU and the sweep measures each successive batch size on a hotter, slower
-device (1800 → 1657 MHz as temperature climbs 77 → 85 °C). Every benchmark row now records
-SM clock, power and temperature, and differences under a measured 5% noise floor are
-reported as `(within noise)` instead of as findings.
-
-**And the engine is not the system.** One preprocessing thread sustains ~46 img/s against
-an engine peak of 703 — a **15×** gap. Saturating this GPU needs ~15 concurrent
-preprocessing workers, which is why the queue and batching phases come before TensorRT.
-
-### Precision: FP16 wins, but only once batching makes the GPU compute-bound
-
-`uv run python scripts/benchmark_precision.py --profile-kernels`
-
-| batch | mode | p50 ms | img/s | peak VRAM | vs fp32 |
-|---|---|---|---|---|---|
-| 8 | fp32 | 15.34 | 537.6 | 106.41 MiB | 1.00× |
-| 8 | tf32 | 11.67 | 650.2 | 106.41 MiB | 1.21× |
-| 8 | **fp16** | **8.04** | **996.4** | **60.95 MiB** | **1.85×** |
-| 32 | **fp16** | **27.65** | **1148.0** | **152.27 MiB** | **1.82×** |
-
-FP16 halves the weights (44.69 → 22.96 MiB) and gives ~1.8× throughput with **100% top-1
-agreement** against FP32 on 32 real image crops (max logit drift 3.4e-02). TF32 gives a
-free 1.1–1.2× with no storage change at all.
-
-**Batch 1 is not reported as a gain.** Across five independent runs FP16/FP32 at batch 1
-measured 1.52×, 1.03×, 1.31×, 1.19×, 1.12× while FP32 stayed within 4% of itself — that
-range is jitter. At ~2.6 ms of GPU work the pipeline is launch-bound, not arithmetic-bound,
-and halving the arithmetic cannot help.
-
-`--profile-kernels` turns "presumably Tensor Cores" into evidence. FP32 runs
-`scudnn_winograd` on CUDA cores and never touches a Tensor Core; FP16 runs
-`cutlass_tensorop_f16_s16816`. But FP16 also spends **22.4% of GPU time** on
-`nchwToNhwc` + `nhwcToNchw` transposes — converting to the layout Tensor Cores want, per
-operator, and back. It wins 1.8× *while* wasting a quarter of its time shuffling memory.
-Eliminating that is what TensorRT's whole-graph layout planning does, which gives Phase 8
-a concrete target rather than a hope.
-
-### ONNX Runtime is not faster than PyTorch here
-
-`uv run python scripts/benchmark_backends.py`
-
-| batch | pytorch | onnxruntime | ratio |
+| configuration | img/s | vs baseline | top-1 agreement |
 |---|---|---|---|
-| 1 | 275.5 img/s | 303.0 img/s | 1.10× |
-| 8 | 572.2 img/s | 568.0 img/s | 0.99× |
-| 16 | 657.8 img/s | 674.6 img/s | 1.03× |
-| 32 | 644.0 img/s | 649.5 img/s | 1.01× |
+| pytorch/fp32 | 560.1 | 1.00× | — |
+| pytorch/fp16 | 1011.3 | 1.81× | 100% |
+| onnxruntime/fp32 | 552.2 | 0.99× | 100% |
+| onnxruntime/fp16 | 817.0 | 1.46× | 100% |
+| tensorrt/fp32 | 857.2 | 1.53× | 100% |
+| **tensorrt/fp16** | **2911.2** | **5.20×** | 100% |
+| tensorrt/int8 | 3153.1 | 5.57× | 90.6% |
 
-Indistinguishable at batch ≥ 8, and the batch-1 edge collapses to 1.06×/1.04×/1.02× when
-re-run in isolation. ORT also uses *more* device VRAM (595 vs 523 MiB at batch 32).
-Agreement with PyTorch is exact where it counts: top-1 100%, max |Δlogit| 1.43e-05.
+TensorRT FP16 computes **3.3× faster than PyTorch FP16 on identical arithmetic**
+(6.98 vs 23.14 ms at batch 32). The gap is layout: PyTorch converts NCHW→NHWC
+per operator and back, burning **22.4% of GPU time** on transposes that compute
+nothing. TensorRT plans layout once for the whole graph.
 
-That's explainable, not surprising. ORT's advantage is whole-graph optimisation — but the
-export had already folded all 20 BatchNorms, so its biggest win was pre-applied. What's
-left is 51 convolution-dominated nodes that both runtimes hand to the same cuDNN kernels.
-Graph fusion pays on many small ops (transformer blocks), not on a plain convnet.
+INT8 works and is not worth it here — 18% over FP16 while top-1 agreement drops
+to 90.6%.
 
-**The bug this phase nearly shipped with.** `get_available_providers()` listed
-`CUDAExecutionProvider`, but the session silently ran on `CPUExecutionProvider` —
-`libonnxruntime_providers_cuda.so` couldn't `dlopen` `libcublasLt.so.13`. No exception.
-Correct answers, ~10× slower. Every "ONNX Runtime CUDA" number here would have been a CPU
-number. `load()` now verifies the provider it got against the one it asked for, and
-preloads torch's bundled CUDA libraries so ORT can find them.
+### And none of it made the system much faster
+
+| clients | req/s | p50 | p99 | server queue wait |
+|---|---|---|---|---|
+| 1 | 37.3 | 26.2 ms | 34.3 ms | 7.2 ms |
+| **25** | **223.6** | 107.4 ms | 158.0 ms | 21.0 ms |
+| 100 | 189.6 | 404.4 ms | 682.8 ms | 14.8 ms |
+
+Peak throughput is **223 req/s against a GPU that sustains 3300 img/s** — about
+7% of the accelerator. Queue wait stays low even at 100 clients, so the backlog
+is not in inference. Raising the preprocessing pool 4→16 workers gave +33%
+throughput with no GPU change at all.
+
+**The GPU accounts for ~7 ms of a 107 ms request.** That is the project's actual
+finding, and it is why the queue and batching phases were built before TensorRT.
+
+### Three traps this project walked into
+
+**`PRECISION=fp32` was not FP32.** PyTorch enables TF32 convolutions by default
+on Ampere — 10 mantissa bits instead of 23 — while tensors still report
+`float32`. Divergence from a CPU reference: **3.56e-03 vs 5.25e-06**, 680×
+worse, silently, with top-1 unaffected. Now an explicit `ALLOW_TF32` flag,
+default off, pinned by a test.
+
+**ONNX Runtime silently ran on the CPU.** `get_available_providers()` listed
+CUDA; the session used `CPUExecutionProvider` because `libcublasLt.so.13` could
+not load. No exception. Correct answers, ~10× slower. Every "ORT CUDA" number
+would have been a CPU number. `load()` now verifies the provider it *got*.
+
+**A benchmark result that was thermal drift.** I reported throughput dropping at
+batch 32. Re-run in isolation the two sizes were indistinguishable (662.9 vs
+665.2 img/s) — this is a 60 W power-capped card and whatever runs last in a
+sweep is measured on a slower GPU. Fixed structurally: clock/power/temperature
+on every benchmark row, rotated sweep order, and a 5% noise floor derived from
+measured variance.
+
+## Documentation
+
+| | |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | Eight Mermaid diagrams: system, request and tensor lifecycle, conversion pipeline, GPU execution and memory hierarchy, batching, multi-GPU |
+| [docs/request-lifecycle.md](docs/request-lifecycle.md) | One request traced from HTTP through CUDA kernels and back, with measured costs |
+| [docs/experiments.md](docs/experiments.md) | All 17 experiments: hypothesis, setup, measurement, result, explanation, trade-off |
+| [docs/interview.md](docs/interview.md) | 40 questions answered from measurements |
+| [docker/README.md](docker/README.md) | Running with the NVIDIA Container Toolkit |
 
 ## Layout
 
 ```
 src/
-  config.py         typed settings, single source of truth
-  inference/        backend implementations behind one interface
-  preprocessing/    image -> NCHW float32 tensor (no torch dependency)
-  queue/            request queue + dynamic batch manager
-  gpu/              memory, streams, profiling
-  monitoring/       metrics
+  config.py         typed settings, validated at import
+  inference/        base.py contract + pytorch / onnx / tensorrt engines
+  model/            architecture table and artifact loading
+  preprocessing/    image -> NCHW float32 (no torch dependency)
+  postprocessing/   softmax + top-k, shared by all backends
+  queue/            bounded request queue + dynamic batch manager
+  gpu/              memory introspection, NVML telemetry
+  monitoring/       Prometheus metrics
   api/              FastAPI routes + schemas
-scripts/            operational entry points (check, export, build, benchmark)
-benchmarks/results/ committed measurements
-docs/               architecture, CUDA, tensors, ONNX, TensorRT, interview prep
+  benchmark.py      one measurement harness for every engine
+  comparison.py     interleaved, order-rotated configuration sweeps
+  main.py           app assembly and lifecycle
+scripts/            check_gpu, fetch_model, infer, export_onnx, build_engine,
+                    quantize_int8, benchmark*, gpu_memory_report, cuda_experiments,
+                    stress_test
+tests/              186 tests
+benchmarks/results/ committed measurements (JSON + CSV)
 ```
+
+## What is deliberately not here
+
+- **Multi-GPU.** One GPU on this machine. The shape is documented, not faked.
+- **Accuracy.** Every comparison measures *agreement between runtimes*, never
+  accuracy — that needs a labelled eval set this project does not have.
+- **CUDA Graphs, streams, pinned memory in the serving path.** All three were
+  implemented, measured, and rejected: 0.99×, 1.01×, and irrelevant next to a
+  21.9 ms preprocessing stage.
+- **`benchmark()` on the engine interface.** Benchmarking is done *to* an
+  engine, not by one; three implementations would drift and could not fairly
+  compare backends.
