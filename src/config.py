@@ -52,6 +52,10 @@ class Precision(StrEnum):
 
     FP32 = "fp32"
     FP16 = "fp16"
+    # INT8 is TensorRT-only here. It is not a runtime flag but a separate
+    # calibrated QDQ graph (scripts/quantize_int8.py); PyTorch and ONNX Runtime
+    # reject it explicitly rather than quietly serving fp32.
+    INT8 = "int8"
 
 
 class Settings(BaseSettings):

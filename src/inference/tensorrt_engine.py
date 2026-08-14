@@ -159,6 +159,9 @@ class TensorRTEngine(InferenceEngine):
         # The engine's declared dtype is the authority. If PRECISION says fp16
         # and the engine is fp32, the numbers would be right and every FP16
         # claim about them would be false.
+        # An INT8 QDQ engine still takes fp32 in: the QuantizeLinear node is
+        # inside the graph, so quantisation happens on the device rather than
+        # in the caller.
         expected = torch.float16 if self._settings.precision is Precision.FP16 else torch.float32
         if self._torch_dtype is not expected:
             raise EngineNotAvailableError(

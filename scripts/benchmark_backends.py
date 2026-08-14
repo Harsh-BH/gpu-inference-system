@@ -50,6 +50,7 @@ ALL_CONFIGS = [
     EngineConfig("onnxruntime/fp16", Backend.ONNXRUNTIME, Precision.FP16),
     EngineConfig("tensorrt/fp32", Backend.TENSORRT, Precision.FP32),
     EngineConfig("tensorrt/fp16", Backend.TENSORRT, Precision.FP16),
+    EngineConfig("tensorrt/int8", Backend.TENSORRT, Precision.INT8),
 ]
 CONFIGS = ALL_CONFIGS
 BASELINE = "pytorch/fp32"

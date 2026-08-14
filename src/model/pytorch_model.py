@@ -37,6 +37,7 @@ WEIGHTS_FILE = "weights.pth"
 LABELS_FILE = "labels.json"
 ONNX_FILE = "model.onnx"
 ONNX_FP16_FILE = "model.fp16.onnx"
+ONNX_INT8_FILE = "model.int8.onnx"
 
 
 def onnx_filename(precision: str) -> str:
@@ -49,7 +50,7 @@ def onnx_filename(precision: str) -> str:
     only honest model, and naming it in one place stops the exporter and the
     two runtimes from disagreeing about where it lives.
     """
-    return ONNX_FP16_FILE if precision == "fp16" else ONNX_FILE
+    return {"fp16": ONNX_FP16_FILE, "int8": ONNX_INT8_FILE}.get(precision, ONNX_FILE)
 
 
 @dataclass(frozen=True, slots=True)

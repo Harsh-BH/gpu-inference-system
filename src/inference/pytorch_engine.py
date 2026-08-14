@@ -79,7 +79,7 @@ class PyTorchEngine(InferenceEngine):
         self._settings = settings
         self._model: torch.nn.Module | None = None
         self._device = torch.device(settings.device)
-        self._dtype = _TORCH_DTYPE[settings.precision]
+        self._dtype = _TORCH_DTYPE.get(settings.precision, torch.float32)
         self._num_classes = arch_spec(settings.model_name).num_classes
 
     # --- lifecycle ------------------------------------------------------
@@ -115,6 +115,13 @@ class PyTorchEngine(InferenceEngine):
         if s.is_cuda:
             torch.backends.cudnn.allow_tf32 = s.allow_tf32
             torch.backends.cuda.matmul.allow_tf32 = s.allow_tf32
+
+        if s.precision is Precision.INT8:
+            raise EngineNotAvailableError(
+                "PRECISION=int8 is TensorRT-only in this project. INT8 here is a "
+                "calibrated QDQ graph, not a runtime cast, so the PyTorch backend "
+                "cannot serve it. Use BACKEND=tensorrt."
+            )
 
         try:
             model = load_from_repository(s.model_dir, s.model_name)

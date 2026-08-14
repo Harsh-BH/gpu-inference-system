@@ -142,6 +142,17 @@ class ONNXRuntimeEngine(InferenceEngine):
                 "onnxruntime is not installed. Run: uv sync --extra onnx"
             ) from exc
 
+        if s.precision.value == "int8":
+            # The QDQ graph parses in ORT, but its CUDA provider has no INT8
+            # kernels for these convolutions and silently falls back to fp32
+            # arithmetic -- fast to load, and not INT8. Refused rather than
+            # reported as an INT8 result.
+            raise EngineNotAvailableError(
+                "PRECISION=int8 is TensorRT-only in this project; ONNX Runtime's "
+                "CUDA provider would execute the QDQ graph in fp32. "
+                "Use BACKEND=tensorrt."
+            )
+
         # Precision is a property of the graph, not a runtime switch: ORT never
         # converts at load time. FP16 means loading a different file.
         path = s.model_dir / onnx_filename(s.precision.value)
