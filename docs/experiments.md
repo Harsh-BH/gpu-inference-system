@@ -722,15 +722,198 @@ backends.
 
 ---
 
+## Experiment 14 — ONNX Runtime vs TensorRT (Phase 9)
+
+**Hypothesis.** TensorRT compiles for this specific GPU, so it should beat both
+eager PyTorch and ONNX Runtime; Experiment 10 named a concrete target, the
+22.4% of GPU time FP16 spent on layout conversion.
+
+**Setup.** `scripts/benchmark_backends.py`, six configurations, interleaved by
+batch size with rotated order, 300 iterations each.
+
+**Measurement.** Throughput, and agreement against `pytorch/fp32`:
+
+| batch 8 | img/s | vs baseline | top-1 | max &#124;Δlogit&#124; |
+|---|---|---|---|---|
+| pytorch/fp32 | 560.1 | 1.00× | — | — |
+| pytorch/fp16 | 1011.3 | 1.81× | 100% | 3.44e-02 |
+| onnxruntime/fp32 | 552.2 | 0.99× | 100% | 1.43e-05 |
+| onnxruntime/fp16 | 817.0 | 1.46× | 100% | 4.33e-02 |
+| tensorrt/fp32 | 857.2 | 1.53× | 100% | 1.34e-05 |
+| **tensorrt/fp16** | **2911.2** | **5.20×** | 100% | 7.26e-02 |
+
+At batch 32 TensorRT FP16 sustains 3270.7 img/s (4.93×) using **less** device
+VRAM than PyTorch FP32 (415 vs 549 MiB).
+
+Stage breakdown at batch 32 (compute only):
+
+```
+pytorch/fp32      45.700 ms      onnxruntime/fp32   45.489 ms
+pytorch/fp16      23.137 ms      onnxruntime/fp16   24.364 ms
+tensorrt/fp32     30.868 ms      tensorrt/fp16       6.983 ms
+```
+
+**Result.** Confirmed, and the mechanism is visible. TensorRT FP16 computes
+**3.3× faster than PyTorch FP16 on identical arithmetic** — 6.983 vs 23.137 ms.
+
+**Explanation.** That gap is almost exactly the layout tax Experiment 10
+measured. PyTorch converts NCHW → NHWC for each Tensor Core operator and back
+again; TensorRT plans layout once for the whole graph and the transposes
+disappear. Nothing about the maths changed.
+
+Every configuration agreed with the baseline on top-1 for all 32 samples, so
+the 5× came with no observable prediction change.
+
+**Trade-off.** The engine is a build artifact tied to GPU architecture,
+TensorRT version and driver — 10 s to build here, and useless on another
+machine. That is the real cost of TensorRT: an extra build step in the deploy
+pipeline and an artifact that cannot be shipped in a container image.
+
+---
+
+## Experiment 15 — Concurrency, and where the backlog actually is (Phase 12)
+
+**Hypothesis.** With TensorRT FP16 sustaining ~3300 img/s, the server should
+handle hundreds of concurrent clients before latency degrades.
+
+**Setup.** `scripts/stress_test.py` against a live server (TensorRT FP16,
+`MAX_BATCH_SIZE=16`, 8 preprocessing workers), 200 requests per level, steady
+concurrency held by a semaphore.
+
+**Measurement.**
+
+| clients | ok | 503 | req/s | p50 ms | p99 ms | server queue p50 |
+|---|---|---|---|---|---|---|
+| 1 | 200 | 0 | 37.3 | 26.2 | 34.3 | 7.2 ms |
+| 5 | 200 | 0 | 142.1 | 34.3 | 45.1 | 7.8 ms |
+| 10 | 200 | 0 | 201.6 | 47.5 | 62.5 | 11.1 ms |
+| **25** | 200 | 0 | **223.6** | 107.4 | 158.0 | 21.0 ms |
+| 50 | 200 | 0 | 215.1 | 211.9 | 306.5 | 19.1 ms |
+| 100 | 200 | 0 | 189.6 | 404.4 | 682.8 | 14.8 ms |
+
+**Result.** Hypothesis was wrong by an order of magnitude. Throughput peaks at
+**223.6 req/s at 25 clients** — about **7% of the GPU's 3300 img/s** — and
+*falls* beyond that while p99 climbs 158 → 683 ms.
+
+**Explanation.** Little's Law: concurrency = throughput × latency. Once
+throughput saturates, every additional client converts directly into waiting.
+
+The diagnostic is the last column. Server-side queue wait stays at 7–27 ms even
+at 100 clients, so the backlog is **not** in the inference queue. Confirmed by
+sweeping the preprocessing pool at 25 clients:
+
+| workers | req/s |
+|---|---|
+| 4 | 167.8 |
+| 8 | 198.3 |
+| 16 | 222.4 |
+| 24 | 216.3 |
+
+Preprocessing is the constraint, exactly as Phase 4 predicted from a bench
+measurement of ~46 img/s per thread. The plateau at 16 matches the core count.
+
+**Trade-off.** This is the project's thesis demonstrated rather than asserted:
+TensorRT made the model 5× faster and moved end-to-end throughput far less,
+because the model was never the bottleneck. The next optimisation is not a
+faster kernel — it is decoding JPEGs somewhere other than a Python thread pool.
+
+---
+
+## Experiment 16 — CUDA streams, pinned memory, CUDA graphs (Phases 18-20)
+
+**Hypothesis.** All three are standard GPU optimisations and should help.
+
+**Measurement.**
+
+| technique | result |
+|---|---|
+| two CUDA streams vs one | 27.532 vs 27.793 ms → **1.01×** |
+| pinned + async H2D, batch 1 | 0.084 → 0.054 ms → 1.54× |
+| pinned + async H2D, batch 32 | 1.819 → 1.521 ms → 1.20× |
+| CUDA graph replay vs eager | 14.683 vs 14.610 ms → **0.99×** |
+
+**Result.** None is adopted.
+
+**Explanation.**
+
+*Streams* permit overlap, they do not manufacture it. One ResNet-18 pass at
+batch 8 already occupies all 20 SMs, so a second stream finds no idle hardware.
+Streams pay when overlapping *different kinds* of work — a copy on the DMA
+engine while the SMs compute.
+
+*Pinned memory* is genuinely faster and genuinely irrelevant here: 0.22 ms of
+H2D against 21.9 ms of preprocessing. Also documented — `non_blocking=True` on
+pageable memory is silently a no-op, since the driver must stage through its own
+pinned buffer, forcing the copy synchronous.
+
+*CUDA graphs* remove CPU launch overhead — ~50 launches at a few microseconds —
+against 14.6 ms of GPU work. Nothing to win.
+
+**What went wrong first, and why it is the useful part.** The graph experiment
+initially reported replay as **13% slower than eager**, which graphs cannot be.
+Suspecting the Experiment 8 thermal confound, the measurement was interleaved;
+it reproduced exactly, so the confound was not thermal. The real cause was
+capturing after only 3 warmup iterations: **a graph freezes whichever kernels
+were selected at capture time**, and cuDNN had not settled, so the replay was
+permanently stuck with a worse algorithm. Capturing after 25 iterations closed
+the gap to 0.99×.
+
+**Trade-off.** Graphs also pin the batch size, which is incompatible with a
+dynamic batcher by construction.
+
+---
+
+## Experiment 17 — INT8 quantisation (Phase 21)
+
+**Hypothesis.** INT8 halves memory traffic again versus FP16 and should be
+meaningfully faster, at some accuracy cost.
+
+**Setup.** ONNX Runtime static PTQ, MinMax calibration on 64 real image crops,
+Int8 symmetric, per-channel weights, QDQ format, compiled by TensorRT.
+
+**Measurement.**
+
+| batch | config | img/s | vs fp32 | top-1 agreement |
+|---|---|---|---|---|
+| 8 | pytorch/fp32 | 566.3 | 1.00× | — |
+| 8 | tensorrt/fp16 | 2674.7 | 4.72× | 100% |
+| 8 | tensorrt/int8 | 3153.1 | 5.57× | **90.6%** |
+| 32 | tensorrt/fp16 | 3311.9 | 4.94× | 100% |
+| 32 | tensorrt/int8 | 3428.0 | 5.12× | 90.6% |
+
+Artifacts: fp32 ONNX 44.66 MiB → int8 QDQ 11.33 MiB; fp32 engine 51.55 MiB →
+int8 engine 11.67 MiB.
+
+**Result.** Works, and is **not worth it here**. INT8 buys 18% over FP16 at
+batch 8 and 3.5% at batch 32 — near the noise floor — while disagreeing with
+the FP32 baseline on 3 of 32 samples.
+
+**Explanation.** ResNet-18 at these batch sizes is not memory-bandwidth-bound
+enough for INT8's halved traffic to matter much, and the stem convolution had
+to stay in float anyway.
+
+Three real incompatibilities had to be solved, each worth knowing:
+
+1. ORT quantises **biases to Int32**; TensorRT 11 rejects a `DequantizeLinear`
+   whose input is Int32 (Int8/Int4/FP8/FP4 only) → `QuantizeBias=False`.
+2. ORT defaults to **UInt8 asymmetric**; TensorRT requires `zero_point == 0`
+   outside DLA → forced Int8 symmetric.
+3. The stem conv is 64×3×7×7. INT8 Tensor Core kernels want channel counts
+   that are multiples of 4, so TensorRT had **no implementation** and the build
+   failed → excluded from quantisation, which is standard practice and also
+   where you would keep float anyway, since first-layer error propagates
+   furthest.
+
+**Trade-off.** Two caveats stated plainly: 90.6% is *agreement with FP32*, not
+accuracy — measuring accuracy needs a labelled eval set this project does not
+have. And calibration used 64 crops of one photo, far less diverse than a real
+calibration set; a better one would likely close some of the gap.
+
+For this model FP16 is the better operating point, and that is the finding.
+
+---
+
 ## Pending
 
-| # | Experiment | Phase |
-|---|---|---|
-| 14 | ONNX Runtime vs TensorRT | 9 |
-| 15 | Static vs dynamic batching | 11 |
-| 16 | Cold start vs warm inference | 13 |
-| 17 | Concurrent users | 12 |
-| 18 | CUDA streams | 18 |
-| 19 | Pinned memory and non-blocking transfer | 19 |
-| 20 | CUDA Graphs | 20 |
-| 21 | INT8 quantisation | 21 |
+Nothing. All 17 experiments are recorded above.
+
