@@ -47,9 +47,9 @@ def create_engine(settings: Settings) -> InferenceEngine:
             return PyTorchEngine(settings)
 
         case Backend.ONNXRUNTIME:
-            raise EngineNotAvailableError(
-                "the onnxruntime backend is not implemented yet (Phase 7). Use BACKEND=pytorch."
-            )
+            from src.inference.onnx_engine import ONNXRuntimeEngine
+
+            return ONNXRuntimeEngine(settings)
 
         case Backend.TENSORRT:
             raise EngineNotAvailableError(

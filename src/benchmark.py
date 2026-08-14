@@ -50,7 +50,7 @@ from time import perf_counter
 
 import numpy as np
 
-from src.gpu.memory import empty_cache, get_peak_memory, reset_peak_memory
+from src.gpu.memory import empty_cache, get_gpu_memory, get_peak_memory, reset_peak_memory
 from src.gpu.telemetry import sample_telemetry
 from src.inference.base import InferenceEngine
 
@@ -103,7 +103,14 @@ class BenchmarkResult:
     latency_per_image_ms: float
 
     # memory
+    #
+    # peak_alloc_bytes is PyTorch's allocator only. ONNX Runtime and TensorRT
+    # allocate through their own allocators, which torch.cuda.max_memory_allocated
+    # cannot see -- it reports ~0 for them. device_used_bytes is the driver's
+    # view (total - free) and therefore the ONLY figure comparable across
+    # backends. Both are kept: their difference is itself informative.
     peak_alloc_bytes: int
+    device_used_bytes: int
 
     # physical state at the end of the measured run. None when NVML is absent.
     # Present because a throughput difference between two rows is only real if
@@ -261,6 +268,7 @@ def benchmark_engine(
         throughput_ips=(iterations * batch_size) / wall_total,
         latency_per_image_ms=float(np.median(latencies)) / batch_size,
         peak_alloc_bytes=get_peak_memory(meta.device),
+        device_used_bytes=get_gpu_memory(meta.device).used_on_device,
         sm_clock_mhz=telemetry.sm_clock_mhz if telemetry else None,
         power_w=telemetry.power_w if telemetry else None,
         temperature_c=telemetry.temperature_c if telemetry else None,
