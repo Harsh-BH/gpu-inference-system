@@ -104,8 +104,11 @@ async def run_level(
                 if response.status_code == 200:
                     ok += 1
                     body = response.json()["latency"]
-                    queue_waits.append(body["queue_wait_ms"])
-                    preprocess.append(body["preprocess_ms"])
+                    # Stage-keyed since Phase 18: `queued_ms` is time spent
+                    # waiting in front of any stage, `stages["decode"]` is the
+                    # image-to-tensor cost that used to be `preprocess_ms`.
+                    queue_waits.append(body["queued_ms"])
+                    preprocess.append(body["stages"].get("decode", 0.0))
                 elif response.status_code == 503:
                     # Backpressure working as designed, not a failure.
                     rejected += 1

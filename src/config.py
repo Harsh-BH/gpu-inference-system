@@ -106,6 +106,24 @@ class Settings(BaseSettings):
     # --- Preprocessing --------------------------------------------------
     image_size: int = Field(default=224, ge=32, le=1024)
 
+    # Scaled JPEG decode. libjpeg can emit 1/2, 1/4 or 1/8 size straight from
+    # the DCT coefficients, skipping most of the inverse transform, and PIL
+    # exposes it as Image.draft(). It applies only when the result would still
+    # be at least the resize target, so it is a no-op on images that are
+    # already small -- and JPEG-only.
+    #
+    # Measured here (Experiment 18): 2.47x on a 1546x1213 photo, 1.73x across a
+    # mixed set at 16 workers, top-1 agreement 8/8, mean confidence drift
+    # 0.0003. Bit-identical output on the samples it declines to scale.
+    #
+    # Defaults ON, unlike ALLOW_TF32, and the difference is worth stating. TF32
+    # silently degrades the FP32 *baseline* every cross-runtime comparison in
+    # this repo is measured against, so it must be opted into. This changes the
+    # input identically for every backend, so it cannot bias a comparison
+    # between them -- and it is the single largest throughput win the serving
+    # path has. Turn it off for a bit-exact reference decode.
+    fast_decode: bool = True
+
     # --- Batching -------------------------------------------------------
     # These two numbers are the entire latency/throughput dial of the system.
     # Bigger batch: better GPU utilisation, more VRAM, higher tail latency.

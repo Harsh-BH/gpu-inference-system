@@ -174,3 +174,56 @@ def test_stack_preserves_per_sample_identity(pre):
 def test_stack_rejects_empty(pre):
     with pytest.raises(PreprocessingError):
         pre.stack([])
+
+
+# --- scaled decode, FAST_DECODE ------------------------------------------
+#
+# `draft()` changes pixels only when it actually reduces, and it only reduces
+# when the result stays at or above the resize target. These tests pin both
+# halves of that: the no-op cases must be bit-identical, and the escape hatch
+# must restore the reference path exactly.
+
+
+def test_draft_is_a_no_op_when_no_reduction_qualifies():
+    """300x300 cannot be halved and stay above 256, so PIL declines to scale
+    and the fast path must produce identical bytes, not merely similar ones."""
+    data = encode(make_image(300, 300), fmt="JPEG")
+    fast = ImagePreprocessor(image_size=224, fast_decode=True).from_bytes(data)
+    exact = ImagePreprocessor(image_size=224, fast_decode=False).from_bytes(data)
+    np.testing.assert_array_equal(fast, exact)
+
+
+@pytest.mark.parametrize("fmt", ["PNG", "BMP", "WEBP"])
+def test_draft_is_a_no_op_for_formats_without_scaled_decode(fmt):
+    """Only JPEG has a scaled inverse DCT. Everything else must be untouched."""
+    data = encode(make_image(1600, 1200), fmt=fmt)
+    fast = ImagePreprocessor(image_size=224, fast_decode=True).from_bytes(data)
+    exact = ImagePreprocessor(image_size=224, fast_decode=False).from_bytes(data)
+    np.testing.assert_array_equal(fast, exact)
+
+
+def test_draft_still_produces_the_contracted_tensor_on_a_large_jpeg():
+    data = encode(make_image(1600, 1200), fmt="JPEG")
+    out = ImagePreprocessor(image_size=224, fast_decode=True).from_bytes(data)
+    assert out.shape == (3, 224, 224)
+    assert out.dtype == np.float32
+    assert np.isfinite(out).all()
+
+
+def test_fast_decode_off_still_matches_torchvision_on_a_large_jpeg():
+    """The escape hatch has to actually be an escape hatch."""
+    torchvision = pytest.importorskip("torchvision.transforms")
+    img = make_image(1600, 1200)
+    data = encode(img, fmt="JPEG")
+
+    reference = torchvision.Compose(
+        [
+            torchvision.Resize(256),
+            torchvision.CenterCrop(224),
+            torchvision.ToTensor(),
+            torchvision.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ]
+    )
+    expected = reference(Image.open(io.BytesIO(data)).convert("RGB")).numpy()
+    ours = ImagePreprocessor(image_size=224, fast_decode=False).from_bytes(data)
+    np.testing.assert_allclose(ours, expected, atol=1e-5)

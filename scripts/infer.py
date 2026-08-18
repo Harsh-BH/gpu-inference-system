@@ -80,7 +80,10 @@ def main() -> int:
         return 1
 
     preprocessor = ImagePreprocessor(
-        image_size=settings.image_size, max_pixels=settings.max_image_pixels
+        image_size=settings.image_size,
+        max_pixels=settings.max_image_pixels,
+        # Honoured here so this CLI traces the same path the server takes.
+        fast_decode=settings.fast_decode,
     )
 
     print("\n\033[1mConfiguration\033[0m")

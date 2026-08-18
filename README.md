@@ -7,10 +7,14 @@ The goal is **not** "call `model(x)` and return a label". The goal is to be able
 and defend this path end to end:
 
 ```
-HTTP request -> queue -> batch -> preprocess -> tensor -> H2D copy
+HTTP request -> queue -> decode -> tensor -> queue -> batch -> H2D copy
              -> runtime (PyTorch | ONNX Runtime | TensorRT) -> CUDA -> SMs/Tensor Cores
-             -> output tensor -> D2H copy -> postprocess -> HTTP response
+             -> output tensor -> D2H copy -> queue -> classify -> HTTP response
 ```
+
+Serving is a three-stage pipeline built on a small, domain-free staged runtime
+(`src/pipeline/`) that is meant to be lifted into other projects — see
+[docs/pipeline.md](docs/pipeline.md).
 
 ## Why GPU inference at all
 
@@ -106,17 +110,37 @@ to 90.6%.
 
 | clients | req/s | p50 | p99 | server queue wait |
 |---|---|---|---|---|
-| 1 | 37.3 | 26.2 ms | 34.3 ms | 7.2 ms |
-| **25** | **223.6** | 107.4 ms | 158.0 ms | 21.0 ms |
-| 100 | 189.6 | 404.4 ms | 682.8 ms | 14.8 ms |
+| 1 | 52.2 | 18.8 ms | 21.1 ms | 5.3 ms |
+| **25** | **326.2** | 72.8 ms | 122.2 ms | 11.7 ms |
+| 100 | 305.6 | 264.5 ms | 497.7 ms | 25.6 ms |
 
-Peak throughput is **223 req/s against a GPU that sustains 3300 img/s** — about
-7% of the accelerator. Queue wait stays low even at 100 clients, so the backlog
-is not in inference. Raising the preprocessing pool 4→16 workers gave +33%
-throughput with no GPU change at all.
+Peak throughput is **326 req/s against a GPU that sustains 3300 img/s** — about
+10% of the accelerator.
 
-**The GPU accounts for ~7 ms of a 107 ms request.** That is the project's actual
-finding, and it is why the queue and batching phases were built before TensorRT.
+The per-stage metrics say exactly why, over a 900-request run:
+
+| stage | total work | share of all work | avg batch |
+|---|---|---|---|
+| **decode** | **17.40 s** | **90.5%** | 1.0 |
+| infer | 1.74 s | 9.0% | 2.3 |
+| classify | 0.08 s | 0.4% | 2.3 |
+
+**Decoding JPEGs is 90% of this system.** The GPU is 9%, and it never even fills
+a batch — 2.3 images per call against a maximum of 16, because decode cannot
+feed it faster. That is the project's actual finding, and it is why the queue and
+batching phases were built before TensorRT.
+
+### The one change that did make it faster
+
+`Image.draft()` — a PIL feature already installed, one line — asks libjpeg for a
+scaled inverse DCT instead of a full decode. **1.62× end-to-end throughput, and
+p99 *fell* from 158.6 to 122.2 ms.** Top-1 agreement 8/8, mean confidence drift
+0.0003, and bit-identical output on images it declines to scale.
+
+GPU decode via nvJPEG, which the previous version of this README named as the
+obvious next step, was implemented and **measured at 0.14×** — one serial device
+against sixteen CPU threads, stealing SMs from the forward pass it was meant to
+feed. Rejected with numbers.
 
 ### Three traps this project walked into
 
@@ -131,6 +155,12 @@ CUDA; the session used `CPUExecutionProvider` because `libcublasLt.so.13` could
 not load. No exception. Correct answers, ~10× slower. Every "ORT CUDA" number
 would have been a CPU number. `load()` now verifies the provider it *got*.
 
+**GPU decode was the obvious answer and it was wrong.** nvJPEG decodes one
+1546×1213 JPEG in 8.08 ms against libjpeg's 13.75 ms — genuinely faster per
+image. But there is one GPU and sixteen decode threads, so in aggregate it lost
+7×, and it competes for the same SMs as inference. The free option (a scaled DCT
+decode, already in PIL) won by 1.73×. Per-image speed is not throughput.
+
 **A benchmark result that was thermal drift.** I reported throughput dropping at
 batch 32. Re-run in isolation the two sizes were indistinguishable (662.9 vs
 665.2 img/s) — this is a 60 W power-capped card and whatever runs last in a
@@ -142,6 +172,7 @@ measured variance.
 
 | | |
 |---|---|
+| [docs/pipeline.md](docs/pipeline.md) | The staged runtime: writing a stage, choosing workers/batch/capacity, backpressure, and how to reuse this as a template |
 | [docs/architecture.md](docs/architecture.md) | Eight Mermaid diagrams: system, request and tensor lifecycle, conversion pipeline, GPU execution and memory hierarchy, batching, multi-GPU |
 | [docs/request-lifecycle.md](docs/request-lifecycle.md) | One request traced from HTTP through CUDA kernels and back, with measured costs |
 | [docs/experiments.md](docs/experiments.md) | All 17 experiments: hypothesis, setup, measurement, result, explanation, trade-off |
@@ -153,23 +184,29 @@ measured variance.
 ```
 src/
   config.py         typed settings, validated at import
+  pipeline/         REUSABLE: Stage, StageSpec, Pipeline. Knows nothing about
+                    images, models, GPUs or HTTP. Copy this into other projects.
+  stages/           THIS APP: decode -> infer -> classify, thin adapters over
+                    the modules below. Replace these to repurpose the template.
   inference/        base.py contract + pytorch / onnx / tensorrt engines
   model/            architecture table and artifact loading
   preprocessing/    image -> NCHW float32 (no torch dependency)
   postprocessing/   softmax + top-k, shared by all backends
-  queue/            bounded request queue + dynamic batch manager
   gpu/              memory introspection, NVML telemetry
-  monitoring/       Prometheus metrics
+  monitoring/       Prometheus metrics, one instrument per kind, labelled by stage
   api/              FastAPI routes + schemas
   benchmark.py      one measurement harness for every engine
   comparison.py     interleaved, order-rotated configuration sweeps
-  main.py           app assembly and lifecycle
+  main.py           app assembly: build_pipeline() IS the architecture
 scripts/            check_gpu, fetch_model, infer, export_onnx, build_engine,
                     quantize_int8, benchmark*, gpu_memory_report, cuda_experiments,
                     stress_test
-tests/              186 tests
+tests/              224 tests
 benchmarks/results/ committed measurements (JSON + CSV)
 ```
+
+The `src/pipeline/` vs `src/stages/` split is the line to cut along when reusing
+this: keep the runtime, replace the stages, edit one list in `main.py`.
 
 ## What is deliberately not here
 
@@ -178,7 +215,12 @@ benchmarks/results/ committed measurements (JSON + CSV)
   accuracy — that needs a labelled eval set this project does not have.
 - **CUDA Graphs, streams, pinned memory in the serving path.** All three were
   implemented, measured, and rejected: 0.99×, 1.01×, and irrelevant next to a
-  21.9 ms preprocessing stage.
+  decode stage that is 90% of the work.
+- **GPU JPEG decode.** Implemented and measured at 0.14× against sixteen CPU
+  threads. Deleted rather than kept behind a flag — a rejected optimisation left
+  in the serving path is a maintenance cost with a measured negative return.
+- **A DAG.** Stages are a line. Branching needs routing, join semantics and a
+  cycle check, and nothing here has a branch.
 - **`benchmark()` on the engine interface.** Benchmarking is done *to* an
   engine, not by one; three implementations would drift and could not fairly
   compare backends.

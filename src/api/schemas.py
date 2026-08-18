@@ -27,15 +27,24 @@ class LatencyBreakdown(BaseModel):
     """Where this request's time went, in milliseconds.
 
     Returned to the client on purpose. It costs nothing, and it makes "the API
-    is slow" a question anyone can answer without server access: a large
-    queue_wait_ms means the server is saturated, a large preprocess_ms means
-    the image was large.
+    is slow" a question anyone can answer without server access: large `waits`
+    mean the server is saturated, a large `stages["decode"]` means the image
+    was large.
+
+    Keyed by stage name rather than fixed `preprocess_ms`/`inference_ms`
+    fields. A pipeline that grows a stage should report it without a schema
+    change, and a template cannot know in advance what its stages are called.
     """
 
-    preprocess_ms: float
-    queue_wait_ms: float
-    inference_ms: float
-    postprocess_ms: float
+    #: stage name -> ms spent working on this request inside that stage.
+    stages: dict[str, float]
+    #: stage name -> ms this request spent queued before that stage ran it.
+    waits: dict[str, float]
+    #: Total time queued rather than worked. The saturation signal.
+    queued_ms: float
+    #: Submit to completion, measured inside the pipeline.
+    pipeline_ms: float
+    #: Everything, including reading the upload and serialising the response.
     total_ms: float
 
 
@@ -91,7 +100,12 @@ class ReadyResponse(BaseModel):
     math_mode: str
     device: str
     max_batch_size: int
+    #: Total items in flight across every stage queue.
     queue_depth: int
+    #: Per-stage backlog, in pipeline order. Which stage the depth piles up in
+    #: front of is the answer to "what is the bottleneck right now", available
+    #: without a Prometheus scrape.
+    stage_depths: dict[str, int] = {}
     detail: str | None = None
 
     model_config = {"protected_namespaces": ()}

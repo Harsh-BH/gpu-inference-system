@@ -9,14 +9,21 @@ flowchart TB
     C[Client] -->|POST /predict<br/>multipart| API[FastAPI handler]
 
     subgraph proc["Server process"]
-        API -->|read, capped at<br/>MAX_UPLOAD_BYTES| PP[Preprocess pool<br/>N threads]
-        PP -->|3,224,224 float32| Q{{"Request queue<br/>bounded, FIFO"}}
-        Q -->|503 when full| API
-        Q --> BM[Batch manager<br/>size OR deadline]
-        BM -->|N,3,224,224| ENG[InferenceEngine]
-        ENG --> BM
-        BM -->|row i -> request i| API
-        API -->|softmax + top-k| C
+        API -->|read, capped at<br/>MAX_UPLOAD_BYTES| Q0{{"queue 0<br/>bounded — rejects"}}
+        Q0 -->|503 + Retry-After<br/>when full| API
+
+        subgraph pipe["Pipeline"]
+            Q0 --> S1["decode<br/>16 workers, batch 1<br/>bytes → 3,224,224"]
+            S1 --> Q1{{"queue 1<br/>bounded — blocks"}}
+            Q1 --> S2["infer<br/>1 worker, batch 16<br/>size OR deadline"]
+            S2 --> Q2{{"queue 2<br/>bounded — blocks"}}
+            Q2 --> S3["classify<br/>inline, batch 64<br/>softmax + top-k"]
+        end
+
+        S3 -->|"Completion(result, stage_ms, wait_ms)"| API
+        API --> C
+        S2 -->|"N,3,224,224"| ENG[InferenceEngine]
+        ENG -->|"N,1000 logits"| S2
     end
 
     ENG -.selected by BACKEND.-> PT[PyTorchEngine]
@@ -27,9 +34,21 @@ flowchart TB
     CUDA --> GPU[(GPU: 20 SMs<br/>Tensor Cores<br/>6 GB VRAM)]
 ```
 
-Preprocessing sits **before** the queue on purpose. Phase 4 measured one
-preprocessing thread sustaining ~46 img/s against an engine that absorbs
-700–3200; putting it inside the batch worker would serialise the slowest stage.
+Each stage has its own bounded queue. **Queue 0 rejects; the rest block** — a
+full downstream queue stalls the upstream worker, and the stall propagates back
+to queue 0 where it becomes a 503. Dropping a request that has already been
+decoded would throw away the most expensive work the system does.
+
+The three stages differ only in how they are *run*, and each setting is a
+measurement:
+
+| stage | workers | batch | why |
+|---|---|---|---|
+| decode | 16 | 1 | CPU-bound and PIL releases the GIL, so threads scale. No per-call fixed cost, so batching would buy nothing. |
+| infer | 1 | 16 | One CUDA context serialises anyway. Per-*call* fixed costs (launches, H2D, the Python/CUDA boundary) are what a batch amortises. |
+| classify | 0 (inline) | 64 | 0.09 ms of numpy. A thread hop would cost more than the work. |
+
+See [pipeline.md](pipeline.md) for the runtime itself.
 
 ## Request lifecycle
 
@@ -37,39 +56,49 @@ preprocessing thread sustaining ~46 img/s against an engine that absorbs
 sequenceDiagram
     participant C as Client
     participant H as Handler
-    participant P as Preprocess pool
-    participant Q as Queue
-    participant B as Batch manager
+    participant PL as Pipeline
+    participant D as decode x16
+    participant I as infer x1
+    participant K as classify
     participant E as Engine
     participant G as GPU
 
     C->>H: POST /predict
     H->>H: read bytes (capped)
-    H->>P: from_bytes(data)
-    P-->>H: (3,224,224) float32
-    H->>Q: submit(request + Future)
-    alt queue full
-        Q-->>C: 503 + Retry-After
+    H->>PL: submit(bytes)
+    alt queue 0 full
+        PL-->>C: 503 + Retry-After
     end
-    H->>H: await Future
+    H->>H: await Completion
 
-    B->>Q: collect until MAX_BATCH_SIZE<br/>or MAX_BATCH_WAIT_MS
-    B->>B: np.stack -> (N,3,224,224)
-    B->>E: predict(batch)  [in a thread]
+    PL->>D: process([bytes])
+    D->>D: draft decode, resize, crop, normalise
+    D-->>PL: (3,224,224) float32
+
+    PL->>I: process([...]) collected until<br/>MAX_BATCH_SIZE or MAX_BATCH_WAIT_MS
+    I->>I: np.stack -> (N,3,224,224)
+    I->>E: predict(batch)
     E->>G: H2D copy
     G->>G: ~50 kernels across the SMs
     G->>E: D2H copy (N x 1000 logits)
-    E-->>B: logits + stage timings
-    B->>H: resolve Future with row i
-    H->>H: softmax + top-k
+    E-->>I: logits + h2d/compute/d2h timings
+    I-->>PL: row i -> item i
+
+    PL->>K: process([logits])
+    K-->>PL: top-5 predictions
+    PL->>H: Completion(result, stage_ms, wait_ms)
     H-->>C: 200 JSON
 ```
+
+`predict()` runs in the infer stage's thread, not on the event loop: it
+synchronises on CUDA, and running it inline would stall every other request —
+health checks, new arrivals, metrics — for the whole forward pass.
 
 ## Tensor lifecycle
 
 ```mermaid
 flowchart LR
-    A["JPEG bytes<br/>~100 KB"] --> B["PIL image<br/>1546x1213 RGB"]
+    A["JPEG bytes<br/>~100 KB"] -->|"draft: scaled inverse DCT<br/>when the input is oversized"| B["PIL image<br/>387x304 RGB<br/>(1546x1213 if FAST_DECODE=false)"]
     B --> C["resized<br/>shorter side 256"]
     C --> D["cropped<br/>224x224x3 uint8"]
     D --> E["CHW float32<br/>normalised<br/>588 KiB"]
@@ -162,9 +191,17 @@ flowchart TB
 ```
 
 The deadline is started by the **first** request in the batch and never reset —
-otherwise a steady trickle postpones dispatch indefinitely. Row-to-request
-mapping is the one place a bug produces confident wrong answers for everyone
-with nothing raised; `tests/test_batching.py` checks it with per-request markers.
+otherwise a steady trickle postpones dispatch indefinitely.
+
+Row-to-request mapping is the one place a bug produces confident wrong answers
+for everyone with nothing raised. It is now a single `zip(..., strict=True)`
+inside the pipeline runner rather than hand-written per batching implementation;
+`tests/test_pipeline.py::test_result_i_goes_to_job_i` checks it with per-request
+markers, and `tests/test_stages.py` checks the engine's own row split.
+
+In practice this system rarely fills a batch: a 900-request run averaged **2.3
+images per GPU call** against a `MAX_BATCH_SIZE` of 16, because decode cannot
+feed the GPU fast enough to reach the size trigger before the deadline.
 
 ## Multi-GPU scaling
 

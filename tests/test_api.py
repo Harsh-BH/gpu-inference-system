@@ -96,12 +96,17 @@ def test_response_identifies_the_engine_that_answered(client):
 
 
 def test_latency_breakdown_is_returned(client):
+    """Keyed by stage name, so a pipeline that grows a stage reports it
+    without a schema change."""
     latency = client.post("/predict", files={"file": ("x.jpg", encode(), "image/jpeg")}).json()[
         "latency"
     ]
-    assert latency["preprocess_ms"] > 0
-    assert latency["total_ms"] >= latency["preprocess_ms"]
-    assert latency["queue_wait_ms"] >= 0
+    assert set(latency["stages"]) == {"decode", "infer", "classify"}
+    assert set(latency["waits"]) == {"decode", "infer", "classify"}
+    assert latency["stages"]["decode"] > 0
+    assert latency["queued_ms"] >= 0
+    assert latency["total_ms"] >= latency["pipeline_ms"]
+    assert latency["pipeline_ms"] >= sum(latency["stages"].values()) * 0.5
 
 
 def test_request_ids_are_unique(client):
@@ -170,14 +175,26 @@ def test_metrics_exposes_the_pipeline_stages(client):
     text = client.get("/metrics").text
     for metric in (
         "inference_requests_total",
-        "inference_queue_wait_seconds",
-        "inference_batch_size",
-        "inference_preprocess_seconds",
-        "inference_compute_seconds",
         "inference_latency_seconds",
         "inference_model_loaded",
+        "inference_compute_seconds",
+        # One instrument per kind of measurement, labelled by stage, so a new
+        # stage is observable without touching the metrics module.
+        "pipeline_stage_work_seconds",
+        "pipeline_stage_wait_seconds",
+        "pipeline_stage_batch_size",
+        "pipeline_stage_items_total",
     ):
         assert metric in text, f"{metric} missing from /metrics"
+
+
+def test_every_stage_is_labelled_in_the_metrics(client):
+    """The point of the labelled instruments: `sum by (stage)` must be able to
+    tell you which stage is the bottleneck, for any pipeline."""
+    client.post("/predict", files={"file": ("x.jpg", encode(), "image/jpeg")})
+    text = client.get("/metrics").text
+    for stage in ("decode", "infer", "classify"):
+        assert f'stage="{stage}"' in text, f"stage {stage} missing from /metrics"
 
 
 def test_metrics_counts_errors_by_reason(client):

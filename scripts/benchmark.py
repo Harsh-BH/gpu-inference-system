@@ -46,7 +46,10 @@ def measure_preprocessing(settings: Settings, runs: int = 30) -> tuple[float, st
     content, so a synthetic fallback is labelled as such rather than quietly
     substituted.
     """
-    pre = ImagePreprocessor(image_size=settings.image_size)
+    # fast_decode from settings: this number is compared against engine
+    # throughput to say whether preprocessing starves the GPU, so it has to be
+    # the preprocessing the server would actually do.
+    pre = ImagePreprocessor(image_size=settings.image_size, fast_decode=settings.fast_decode)
     if SAMPLE_IMAGE.is_file():
         data, source = SAMPLE_IMAGE.read_bytes(), f"{SAMPLE_IMAGE}"
     else:

@@ -1,18 +1,19 @@
-"""HTTP endpoints (Phases 15 and 17).
+"""HTTP endpoints (Phases 15, 17; moved onto the pipeline in Phase 18).
 
-THE PATH A REQUEST TAKES THROUGH THIS FILE
+WHAT THIS FILE DOES, AND WHAT IT NO LONGER DOES
 
-    read bytes (capped)
-      -> preprocess in a thread pool        parallel across requests
-      -> enqueue with a Future              bounded; rejects when full
-      -> await the Future                   the batch worker resolves it
-      -> postprocess                        softmax + top-k
-      -> respond
+    read bytes (capped)  -> pipeline.submit(bytes) -> serialise the response
 
-    Preprocessing happens *before* the queue, in an executor, because Phase 4
-    measured a single preprocessing thread sustaining ~46 img/s against an
-    engine that absorbs 700-3200. Doing it in the batch worker would serialise
-    the slowest stage. What is queued is already a tensor.
+    That is the whole handler. It does not decode images, does not know that a
+    queue exists, does not stack a batch, and does not know what softmax is.
+    Every transformation lives in `src/stages/`, composed in `src/main.py`.
+
+    Before, this file dispatched preprocessing to a thread pool, built an
+    `InferenceRequest`, submitted it to a queue, awaited a Future and ran
+    top-k. Five responsibilities in an HTTP handler, and the pipeline's shape
+    was something you reconstructed by reading three modules. Now the handler
+    has one responsibility -- translate between HTTP and the pipeline -- and
+    the pipeline's shape is a list you can read in one screen.
 
 FAILURE MAPPING
 
@@ -20,7 +21,7 @@ FAILURE MAPPING
 
       400  bad image            do not retry, the input is wrong
       413  too large            do not retry, the input is too big
-      503  queue full           retry after a moment, with Retry-After
+      503  pipeline full        retry after a moment, with Retry-After
       503  engine unavailable   retry, the server is not serving right now
       504  timed out            retry, the deadline passed
       500  anything else        a bug; the client learns nothing else
@@ -38,9 +39,8 @@ import uuid
 from time import perf_counter
 from typing import Annotated
 
-import numpy as np
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from src.api.schemas import (
@@ -51,9 +51,8 @@ from src.api.schemas import (
     ReadyResponse,
 )
 from src.inference.base import EngineError, EngineNotAvailableError
-from src.postprocessing import top_k
+from src.pipeline import PipelineError, PipelineFull
 from src.preprocessing import PreprocessingError
-from src.queue import InferenceRequest, QueueFull
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -100,43 +99,25 @@ async def predict(request: Request, file: Annotated[UploadFile, File()]) -> Pred
 
     data = await _read_capped(file, settings.max_upload_bytes)
 
-    # --- preprocess, off the event loop ---------------------------------
-    t0 = perf_counter()
     try:
-        tensor = await asyncio.get_running_loop().run_in_executor(
-            state.preprocess_pool, state.preprocessor.from_bytes, data
+        completion = await asyncio.wait_for(
+            state.pipeline.submit(data, job_id=request_id),
+            timeout=settings.request_timeout_ms / 1000.0,
         )
-    except PreprocessingError as exc:
-        # Client input problem: say what is wrong, it is safe and actionable.
-        metrics.errors_total.labels(reason="bad_image").inc()
-        metrics.requests_total.labels(status="error").inc()
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    preprocess_ms = (perf_counter() - t0) * 1000.0
-    metrics.preprocess.observe(preprocess_ms / 1000.0)
-
-    # --- queue ----------------------------------------------------------
-    loop = asyncio.get_running_loop()
-    inference_request = InferenceRequest(
-        request_id=request_id,
-        tensor=tensor,
-        future=loop.create_future(),
-        preprocess_ms=preprocess_ms,
-    )
-    try:
-        state.queue.submit(inference_request)
-    except QueueFull as exc:
+    except PipelineFull as exc:
         metrics.errors_total.labels(reason="queue_full").inc()
         metrics.requests_total.labels(status="rejected").inc()
         # 503 with Retry-After rather than 429: this is server capacity, not a
         # per-client rate limit, and the distinction matters to a load balancer.
-        raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": "1"}) from exc
-
-    metrics.queue_depth.set(state.queue.depth)
-
-    try:
-        logits: np.ndarray = await asyncio.wait_for(
-            inference_request.future, timeout=settings.request_timeout_ms / 1000.0
-        )
+        raise HTTPException(
+            status_code=503, detail=str(exc), headers={"Retry-After": "1"}
+        ) from exc
+    except PreprocessingError as exc:
+        # Client input problem: say what is wrong, it is safe and actionable.
+        # Raised by the decode stage and delivered here through the job.
+        metrics.errors_total.labels(reason="bad_image").inc()
+        metrics.requests_total.labels(status="error").inc()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except TimeoutError:
         metrics.errors_total.labels(reason="timeout").inc()
         metrics.requests_total.labels(status="error").inc()
@@ -146,29 +127,22 @@ async def predict(request: Request, file: Annotated[UploadFile, File()]) -> Pred
         ) from None
     except EngineNotAvailableError as exc:
         metrics.errors_total.labels(reason="engine_unavailable").inc()
+        metrics.requests_total.labels(status="error").inc()
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except EngineError as exc:
-        # Includes CUDA OOM, which is a capacity problem, not a client problem.
+    except (EngineError, PipelineError) as exc:
+        # Includes CUDA OOM, which is a capacity problem, not a client problem,
+        # and a shutdown that stranded this request.
         logger.warning("request %s failed: %s", request_id, exc)
         metrics.errors_total.labels(reason="inference_failed").inc()
         metrics.requests_total.labels(status="error").inc()
         raise HTTPException(status_code=503, detail="inference failed") from exc
 
-    queue_wait_ms = inference_request.queue_wait_ms
-    metrics.queue_wait.observe(queue_wait_ms / 1000.0)
-
-    # --- postprocess ----------------------------------------------------
-    t0 = perf_counter()
-    ranked = top_k(logits[None, :], state.labels, k=5)[0]
-    postprocess_ms = (perf_counter() - t0) * 1000.0
-    metrics.postprocess.observe(postprocess_ms / 1000.0)
-
     total_ms = (perf_counter() - started) * 1000.0
     metrics.total_latency.observe(total_ms / 1000.0)
     metrics.requests_total.labels(status="ok").inc()
-    metrics.queue_depth.set(state.queue.depth)
 
-    meta = state.engine.metadata
+    ranked = completion.result
+    meta = state.inference_stage.metadata
     return PredictResponse(
         request_id=request_id,
         model_name=meta.model_name,
@@ -182,13 +156,10 @@ async def predict(request: Request, file: Annotated[UploadFile, File()]) -> Pred
             for p in ranked
         ],
         latency=LatencyBreakdown(
-            preprocess_ms=preprocess_ms,
-            queue_wait_ms=queue_wait_ms,
-            # Everything between enqueue and resolution: batch formation plus
-            # the GPU call. Separating them further needs the batch's own
-            # timings, which /metrics has.
-            inference_ms=max(0.0, total_ms - preprocess_ms - postprocess_ms - queue_wait_ms),
-            postprocess_ms=postprocess_ms,
+            stages=completion.stage_ms,
+            waits=completion.wait_ms,
+            queued_ms=completion.queued_ms,
+            pipeline_ms=completion.total_ms,
             total_ms=total_ms,
         ),
     )
@@ -215,11 +186,12 @@ async def ready(request: Request):
     """
     state = request.app.state
     settings = state.settings
-    is_ready = bool(state.ready and state.engine is not None and state.engine.is_loaded)
+    pipeline = getattr(state, "pipeline", None)
+    is_ready = bool(state.ready and pipeline is not None and pipeline.is_running)
 
     if is_ready:
-        meta = state.engine.metadata
-        body = ReadyResponse(
+        meta = state.inference_stage.metadata
+        return ReadyResponse(
             ready=True,
             model_name=meta.model_name,
             model_version=meta.model_version,
@@ -228,11 +200,9 @@ async def ready(request: Request):
             math_mode=meta.math_mode,
             device=meta.device,
             max_batch_size=meta.max_batch_size,
-            queue_depth=state.queue.depth if state.queue else 0,
+            queue_depth=pipeline.depth,
+            stage_depths=pipeline.depths,
         )
-        return body
-
-    from fastapi.responses import JSONResponse
 
     body = ReadyResponse(
         ready=False,
@@ -244,6 +214,7 @@ async def ready(request: Request):
         device=settings.device,
         max_batch_size=settings.max_batch_size,
         queue_depth=0,
+        stage_depths={},
         detail=getattr(state, "startup_error", None) or "engine is still loading",
     )
     return JSONResponse(status_code=503, content=body.model_dump())
@@ -255,8 +226,9 @@ async def metrics_endpoint(request: Request) -> PlainTextResponse:
     # Sampled per scrape, not per request: NVML costs 0.1-1 ms, which is
     # irrelevant every 15 seconds and ruinous at 3000 requests per second.
     state.metrics.observe_gpu(state.settings.device)
-    if state.queue is not None:
-        state.metrics.queue_depth.set(state.queue.depth)
+    pipeline = getattr(state, "pipeline", None)
+    if pipeline is not None and pipeline.is_running:
+        state.metrics.observe_depths(pipeline.depths)
     return PlainTextResponse(
         generate_latest(state.metrics.registry), media_type=CONTENT_TYPE_LATEST
     )

@@ -1,20 +1,32 @@
-"""Application assembly and lifecycle (Phases 13, 14, 15, 17).
+"""Application assembly and lifecycle (Phases 13, 14, 15, 17, 18).
 
     uv run uvicorn src.main:app --host 0.0.0.0 --port 8000
 
+THE PIPELINE IS THE ARCHITECTURE
+
+    `build_pipeline()` below is the whole serving design, in one readable list.
+    Reading it tells you what the system does, in what order, with how much
+    concurrency, and where it will batch. Nothing else has to be consulted.
+
+    That is the point of the rewrite. The previous version spread the same
+    behaviour across an HTTP handler, a thread pool, a request queue and a
+    batch manager, and the only way to know the shape was to read all four and
+    hold them in your head at once.
+
+    To adapt this project to a different problem: replace the stages in
+    `src/stages/`, edit that list, and leave `src/pipeline/` alone.
+
 STARTUP ORDER, AND WHY IT IS THIS ORDER
 
-    1. build the engine named by BACKEND        no GPU work yet
-    2. load()                                    weights to VRAM, engine plan
-    3. warmup()                                  pay initialisation costs here
-    4. start the batch manager
-    5. only now report ready
+    `pipeline.start()` sets every stage up in order, then starts workers. For
+    the inference stage, setup is load() + warmup(), so by the time any worker
+    exists the engine is warm. Only then is readiness reported.
 
     Warmup before ready is the entire point of Phase 13. A cold engine's first
     forward pass pays lazy CUDA context creation, kernel module loading, cuDNN
     algorithm selection and allocator growth. Somebody has to pay that; it must
-    not be the first user. Reporting ready before warmup would hand the whole
-    bill to whoever arrives first.
+    not be the first user. Reporting ready before warmup hands the whole bill
+    to whoever arrives first.
 
 SHUTDOWN ORDER IS THE REVERSE, AND ALSO DELIBERATE
 
@@ -32,7 +44,7 @@ MODEL VERSIONING (PHASE 14)
 
 A FAILED LOAD IS NOT A CRASH
 
-    If the engine cannot load -- missing artifact, no GPU, incompatible
+    If a stage cannot set up -- missing artifact, no GPU, incompatible
     TensorRT plan -- the process still starts and serves /health and /metrics,
     with /ready returning 503 and the reason. That is what an operator needs:
     a container that stays up long enough to be inspected, and a readiness
@@ -45,7 +57,6 @@ from __future__ import annotations
 import logging
 import sys
 from collections.abc import AsyncIterator
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from time import perf_counter
 
@@ -60,11 +71,16 @@ from src.config import Settings, get_settings
 from src.inference import create_engine
 from src.inference.base import EngineError
 from src.model.pytorch_model import ModelArtifactError, load_labels
-from src.monitoring import get_metrics
+from src.monitoring import Metrics, get_metrics
+from src.pipeline import Pipeline, StageSpec
 from src.preprocessing import ImagePreprocessor
-from src.queue import BatchManager, RequestQueue
+from src.stages import ClassifyStage, ImageDecodeStage, InferenceStage
 
 logger = logging.getLogger("gpu-inference")
+
+#: Ranked predictions are ~0.1 ms of work, so the classify stage batches
+#: generously to vectorise softmax without ever being worth waiting for.
+_CLASSIFY_MAX_BATCH = 64
 
 
 def configure_logging(level: str) -> None:
@@ -75,81 +91,99 @@ def configure_logging(level: str) -> None:
     )
 
 
-def _record_batch(metrics, outcome) -> None:
-    metrics.batch_size.observe(outcome.batch_size)
-    metrics.batch_formation.observe(outcome.formation_ms / 1000.0)
-    metrics.h2d.observe(outcome.h2d_ms / 1000.0)
-    metrics.compute.observe(outcome.compute_ms / 1000.0)
-    metrics.d2h.observe(outcome.d2h_ms / 1000.0)
+def build_pipeline(
+    settings: Settings, metrics: Metrics, labels: list[str]
+) -> tuple[Pipeline, InferenceStage]:
+    """Assemble the serving pipeline. Constructs; does not start or load.
+
+    Returned alongside the inference stage because /ready and every prediction
+    response need the engine's identity, and that is the one stage the HTTP
+    layer legitimately has to know about.
+    """
+    decode = ImageDecodeStage(
+        ImagePreprocessor(
+            image_size=settings.image_size,
+            max_pixels=settings.max_image_pixels,
+            fast_decode=settings.fast_decode,
+        )
+    )
+    infer = InferenceStage(
+        create_engine(settings),
+        warmup_requests=settings.warmup_requests,
+        on_timings=metrics.record_engine_timings,
+    )
+    classify = ClassifyStage(labels)
+
+    pipeline = Pipeline(
+        [
+            # CPU-bound, parallel, one image per call. Decoding is the most
+            # expensive thing this system does on the CPU and the cheapest to
+            # parallelise; PIL releases the GIL during decode and resize, which
+            # is the only reason threads help here at all.
+            StageSpec(
+                decode,
+                workers=settings.preprocess_workers,
+                max_batch=1,
+                capacity=settings.queue_max_size,
+            ),
+            # GPU-bound, serialised, batched. One CUDA context means a second
+            # worker would serialise anyway; the batch is where throughput is
+            # bought and tail latency is paid.
+            StageSpec(
+                infer,
+                workers=1,
+                max_batch=settings.max_batch_size,
+                max_batch_wait_ms=settings.max_batch_wait_ms,
+                capacity=settings.queue_max_size,
+            ),
+            # Microseconds of numpy. A thread hop would cost more than the work.
+            StageSpec(
+                classify,
+                workers=0,
+                max_batch=_CLASSIFY_MAX_BATCH,
+                capacity=settings.queue_max_size,
+            ),
+        ],
+        on_stage=metrics.record_stage,
+    )
+    return pipeline, infer
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: Settings = app.state.settings
-    metrics = app.state.metrics
+    metrics: Metrics = app.state.metrics
     configure_logging(settings.log_level)
 
     app.state.ready = False
     app.state.startup_error = None
-    app.state.engine = None
-    app.state.queue = None
-    app.state.batch_manager = None
-
-    app.state.preprocessor = ImagePreprocessor(
-        image_size=settings.image_size, max_pixels=settings.max_image_pixels
-    )
-    # Preprocessing is the measured bottleneck (Phase 4: ~46 img/s per thread
-    # against an engine that absorbs 700-3200), so it gets a pool sized to
-    # actually feed the GPU rather than a single worker.
-    app.state.preprocess_pool = ThreadPoolExecutor(
-        max_workers=settings.preprocess_workers, thread_name_prefix="preprocess"
-    )
+    app.state.pipeline = None
+    app.state.inference_stage = None
 
     logger.info(
-        "starting: model=%s version=%s backend=%s precision=%s device=%s",
+        "starting: model=%s version=%s backend=%s precision=%s device=%s fast_decode=%s",
         settings.model_name,
         settings.model_version,
         settings.backend.value,
         settings.precision.value,
         settings.device,
+        settings.fast_decode,
     )
 
     try:
-        app.state.labels = load_labels(settings.model_dir)
-        engine = create_engine(settings)
+        labels = load_labels(settings.model_dir)
+        pipeline, inference_stage = build_pipeline(settings, metrics, labels)
 
         started = perf_counter()
-        engine.load()
-        logger.info("engine loaded in %.0f ms", (perf_counter() - started) * 1000)
+        # Loads weights, warms the engine, then starts workers. Anything that
+        # fails here fails before a single request can arrive.
+        pipeline.start()
+        logger.info("pipeline ready in %.0f ms", (perf_counter() - started) * 1000)
 
-        # Phase 13. The cost is paid here, before anyone is told we are ready.
-        started = perf_counter()
-        engine.warmup(settings.warmup_requests)
-        logger.info(
-            "warmed up with %d iterations in %.0f ms",
-            settings.warmup_requests,
-            (perf_counter() - started) * 1000,
-        )
-
-        app.state.engine = engine
-        app.state.queue = RequestQueue(max_size=settings.queue_max_size)
-        app.state.batch_manager = BatchManager(
-            engine,
-            app.state.queue,
-            max_batch_size=settings.max_batch_size,
-            max_batch_wait_ms=settings.max_batch_wait_ms,
-            on_batch=lambda outcome: _record_batch(metrics, outcome),
-        )
-        app.state.batch_manager.start()
-
+        app.state.pipeline = pipeline
+        app.state.inference_stage = inference_stage
         app.state.ready = True
         metrics.model_loaded.set(1)
-        logger.info(
-            "ready: max_batch=%d wait=%.1fms queue=%d",
-            settings.max_batch_size,
-            settings.max_batch_wait_ms,
-            settings.queue_max_size,
-        )
 
     except (EngineError, ModelArtifactError) as exc:
         # Stay up so /ready can explain why. See the module docstring.
@@ -163,11 +197,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("shutting down")
         app.state.ready = False
         metrics.model_loaded.set(0)
-        if app.state.batch_manager is not None:
-            await app.state.batch_manager.stop()
-        app.state.preprocess_pool.shutdown(wait=False, cancel_futures=True)
-        if app.state.engine is not None:
-            app.state.engine.unload()
+        if app.state.pipeline is not None:
+            await app.state.pipeline.stop()
         logger.info("stopped")
 
 
@@ -178,7 +209,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(
         title="gpu-inference-system",
         description="Image classification over HTTP, with the GPU path made visible.",
-        version="0.1.0",
+        version="0.2.0",
         lifespan=lifespan,
     )
     app.state.settings = settings

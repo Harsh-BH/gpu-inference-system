@@ -1,4 +1,4 @@
-"""Prometheus metrics (Phase 16).
+"""Prometheus metrics (Phase 16, generalised to the pipeline in Phase 18).
 
 WHY HISTOGRAMS AND NOT AVERAGES
 
@@ -11,15 +11,29 @@ WHY HISTOGRAMS AND NOT AVERAGES
     Bucket edges matter: a histogram can only resolve latency where it has
     boundaries. These are chosen around what this system actually does --
     sub-millisecond GPU stages, single-digit-millisecond inference, tens of
-    milliseconds for preprocessing and end-to-end.
+    milliseconds for decoding and end-to-end.
 
-WHY EVERY STAGE IS MEASURED SEPARATELY
+WHY THE STAGE METRICS ARE LABELLED RATHER THAN NAMED
 
-    "The API is slow" is not actionable. "Queue wait is 400 ms while inference
-    is 3 ms" says the GPU is saturated and you need capacity or bigger batches.
-    "Preprocess is 20 ms while inference is 3 ms" says buy CPU, not GPU. The
-    split is what turns a complaint into a decision, and Phase 1 already showed
-    those two diagnoses pointing in opposite directions on this workload.
+    They used to be `inference_preprocess_seconds`, `inference_postprocess_
+    seconds`, `inference_queue_wait_seconds` -- one instrument per stage, hard
+    coded. Adding a stage meant adding an instrument, a call site and a
+    dashboard panel, so in practice stages went unmeasured.
+
+    Now there is one instrument per *kind* of measurement, labelled by stage.
+    Any pipeline gets complete per-stage observability with no code here at
+    all, which is what makes `src/pipeline/` reusable rather than merely
+    generic. `sum by (stage) (rate(...))` answers "which stage is the
+    bottleneck" for a pipeline this module has never heard of.
+
+WHY WAIT AND WORK ARE SEPARATE INSTRUMENTS
+
+    They diagnose opposite problems. Rising *work* means the stage itself got
+    slower -- a bigger image, a colder cache, a throttled GPU. Rising *wait*
+    with flat work means the stage is saturated and the fix is capacity or
+    concurrency, not a faster implementation. Phase 1 of this project had those
+    two diagnoses pointing in opposite directions on the same workload, which
+    is why they are never summed into one number.
 """
 
 from __future__ import annotations
@@ -27,6 +41,9 @@ from __future__ import annotations
 from functools import lru_cache
 
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
+
+from src.inference.base import StageTimings
+from src.pipeline import StageReport
 
 # Latency buckets in seconds. Deliberately dense between 1 ms and 100 ms, which
 # is where every stage of this system lives.
@@ -54,36 +71,52 @@ class Metrics:
         self.errors_total = Counter(
             "inference_errors_total", "Requests that failed", ["reason"], registry=r
         )
-
-        # --- queue ---
-        self.queue_depth = Gauge(
-            "inference_queue_depth", "Requests waiting in the queue", registry=r
-        )
-        self.queue_wait = Histogram(
-            "inference_queue_wait_seconds",
-            "Time from enqueue to batch dispatch",
+        self.total_latency = Histogram(
+            "inference_latency_seconds",
+            "End-to-end, as the client experiences it",
             buckets=_SLOW,
             registry=r,
         )
 
-        # --- batching ---
-        self.batch_size = Histogram(
-            "inference_batch_size",
-            "Images per dispatched batch",
-            buckets=(1, 2, 4, 8, 16, 32, 64),
+        # --- pipeline, per stage ---
+        self.stage_work = Histogram(
+            "pipeline_stage_work_seconds",
+            "Time inside a stage's process(), per batch",
+            ["stage"],
+            buckets=_SLOW,
             registry=r,
         )
-        self.batch_formation = Histogram(
-            "inference_batch_formation_seconds",
-            "Time spent assembling a batch",
-            buckets=_FAST,
+        self.stage_wait = Histogram(
+            "pipeline_stage_wait_seconds",
+            "Time an item spent queued before a stage ran it",
+            ["stage"],
+            buckets=_SLOW,
+            registry=r,
+        )
+        self.stage_batch_size = Histogram(
+            "pipeline_stage_batch_size",
+            "Items per process() call",
+            ["stage"],
+            buckets=(1, 2, 4, 8, 16, 32, 64, 128),
+            registry=r,
+        )
+        self.stage_items = Counter(
+            "pipeline_stage_items_total",
+            "Items leaving a stage",
+            ["stage", "outcome"],
+            registry=r,
+        )
+        self.stage_depth = Gauge(
+            "pipeline_stage_queue_depth",
+            "Items waiting in front of a stage",
+            ["stage"],
             registry=r,
         )
 
-        # --- pipeline stages ---
-        self.preprocess = Histogram(
-            "inference_preprocess_seconds", "Image decode to tensor", buckets=_SLOW, registry=r
-        )
+        # --- inside the engine ---
+        # Not stage metrics: only an engine can see these, and only for the one
+        # stage that runs a model. A caller holding a numpy array cannot
+        # observe how long the PCIe copy took.
         self.h2d = Histogram(
             "inference_h2d_seconds", "Host to device copy", buckets=_FAST, registry=r
         )
@@ -92,15 +125,6 @@ class Metrics:
         )
         self.d2h = Histogram(
             "inference_d2h_seconds", "Device to host copy", buckets=_FAST, registry=r
-        )
-        self.postprocess = Histogram(
-            "inference_postprocess_seconds", "Softmax and top-k", buckets=_FAST, registry=r
-        )
-        self.total_latency = Histogram(
-            "inference_latency_seconds",
-            "End-to-end, as the client experiences it",
-            buckets=_SLOW,
-            registry=r,
         )
 
         # --- GPU ---
@@ -118,6 +142,35 @@ class Metrics:
         self.model_loaded = Gauge(
             "inference_model_loaded", "1 when the engine is ready to serve", registry=r
         )
+
+    # --- observers -------------------------------------------------------
+
+    def record_stage(self, report: StageReport) -> None:
+        """Wired to `Pipeline(on_stage=...)`. Called once per process() call.
+
+        Cheap on purpose: this runs on the event loop after every batch of
+        every stage, so it does arithmetic and nothing else. Anything that
+        could block or fail belongs behind a scrape, not here.
+        """
+        stage = report.stage
+        self.stage_work.labels(stage=stage).observe(report.work_ms / 1000.0)
+        self.stage_wait.labels(stage=stage).observe(report.wait_ms / 1000.0)
+        self.stage_batch_size.labels(stage=stage).observe(report.batch_size)
+        if report.succeeded:
+            self.stage_items.labels(stage=stage, outcome="ok").inc(report.succeeded)
+        if report.failed:
+            self.stage_items.labels(stage=stage, outcome="error").inc(report.failed)
+
+    def record_engine_timings(self, timings: StageTimings, batch_size: int) -> None:
+        """Wired to `InferenceStage(on_timings=...)`."""
+        self.h2d.observe(timings.h2d_ms / 1000.0)
+        self.compute.observe(timings.compute_ms / 1000.0)
+        self.d2h.observe(timings.d2h_ms / 1000.0)
+
+    def observe_depths(self, depths: dict[str, int]) -> None:
+        """Sample queue depths. Called on scrape, not per request."""
+        for stage, depth in depths.items():
+            self.stage_depth.labels(stage=stage).set(depth)
 
     def observe_gpu(self, device: str) -> None:
         """Sample GPU state. Called on /metrics scrape, never per request.

@@ -1007,7 +1007,170 @@ sees each new batch size.
 
 ---
 
+## Experiment 20 — The pipeline refactor, and what it cost (Phase 22)
+
+**Hypothesis.** Replacing the hand-written preprocessing pool, request queue and
+batch manager with one generic staged runtime should be throughput-**neutral**.
+It is a restructuring, not an optimisation, and a restructuring that quietly
+costs 20% is a failed one.
+
+**Setup.** Same box, same artifacts, TensorRT FP16, `MAX_BATCH_SIZE=16`,
+`PREPROCESS_WORKERS=16`, 300 requests per level, `FAST_DECODE=false` so that
+only the structural change is in scope. Compared against the committed
+`benchmarks/results/concurrency.csv` from the previous architecture.
+
+**Measurement.**
+
+| clients | before (queue + batch manager) | after (pipeline) |
+|---|---|---|
+| 25 | 186.7 req/s, p99 193.7 ms | 201.2 req/s, p99 158.6 ms |
+
+**Result.** Neutral, as required — within the 5% noise floor of a 60 W
+power-capped laptop GPU, and if anything slightly ahead.
+
+**Explanation.** The runtime shape did not change, only who owns it. Before:
+preprocessing in a `ThreadPoolExecutor`, a bounded `asyncio.Queue`, a batch
+worker calling `asyncio.to_thread`. After: three `StageSpec`s describing exactly
+the same three things. The same threads do the same work in the same order.
+
+What did change is what the code can now tell you. Per-stage instrumentation
+used to require adding an instrument, a call site and a dashboard panel per
+stage, so in practice stages went unmeasured. Now one labelled instrument covers
+any pipeline, and 900 requests produce this without a line of bespoke
+measurement:
+
+| stage | total work | share of all work | avg batch |
+|---|---|---|---|
+| decode | 17.40 s | **90.5%** | 1.0 |
+| infer | 1.74 s | 9.0% | 2.3 |
+| classify | 0.08 s | 0.4% | 2.3 |
+
+**Trade-off.** Three real costs, stated plainly.
+
+1. **A layer of indirection.** Following a request now means reading the stage
+   list plus one runner, instead of one straight-line handler. Worth it at three
+   stages; it would not be at one.
+2. **A response-schema break.** `latency` went from fixed
+   `preprocess_ms`/`inference_ms`/`postprocess_ms` fields to `stages` and
+   `waits` keyed by stage name. A template cannot know its own stage names, and
+   a pipeline that grows a stage should report it without a schema change — but
+   this is a breaking change for any existing client.
+3. **Metric renames.** `inference_preprocess_seconds` and friends became
+   `pipeline_stage_work_seconds{stage="decode"}`. Dashboards break once.
+
+The average inference batch of 2.3 against a `MAX_BATCH_SIZE` of 16 is itself
+the finding restated: the GPU is never given enough work to fill a batch,
+because decode cannot feed it faster.
+
+---
+
+## Experiment 21 — Where to decode a JPEG (Phase 22)
+
+**Hypothesis.** Decoding is 90% of the work in this system, so moving it to the
+GPU with nvJPEG should be the single largest win available. The previous
+architecture document said so explicitly: *"the optimisation that matters next
+is not a faster kernel; it is decoding JPEGs somewhere other than a Python
+thread pool."*
+
+**Setup.** Three candidates, measured on the same images on the same box.
+Reference is the existing PIL path. `data/dog.jpg` is 1546x1213; the eight
+ImageNet samples are ~500x400. 16 decode threads where threads apply.
+
+**Measurement.**
+
+Where the 21.5 ms actually goes, for one 1546x1213 JPEG:
+
+| step | cost |
+|---|---|
+| `Image.open` | 0.13 ms |
+| **decode** | **13.75 ms** |
+| resize | 5.05 ms |
+| crop | 0.03 ms |
+| to float + normalise | 0.19 ms |
+
+So the decode itself dominates, and the candidates:
+
+| candidate | 16 threads, mixed set | one 1546x1213 photo | new deps |
+|---|---|---|---|
+| PIL, full decode (reference) | 919 img/s | 21.15 ms | — |
+| **PIL `draft()`, scaled decode** | **1595 img/s (1.73x)** | **8.57 ms (2.47x)** | none |
+| GPU nvJPEG + resize | 132 img/s (0.14x) | 8.62 ms | none |
+
+GPU decode, broken down: 8.08 ms is the nvJPEG decode itself and 0.27-0.47 ms is
+the resize.
+
+Agreement for `draft()`, through TensorRT FP16 on 8 real ImageNet images:
+
+| | |
+|---|---|
+| top-1 agreement | **8/8 = 100%** |
+| top-5 set identical | 8/8 |
+| top-1 confidence drift | mean 0.0003, max 0.0021 |
+| tensor difference, samples it declines to scale | **exactly 0.000** |
+
+End to end on the live server, 300 requests per level:
+
+| clients | full decode | scaled decode | gain |
+|---|---|---|---|
+| 1 | 35.8 req/s, p50 27.8 ms | 52.2 req/s, p50 18.8 ms | 1.46x |
+| **25** | **201.2 req/s, p99 158.6 ms** | **326.2 req/s, p99 122.2 ms** | **1.62x** |
+| 100 | 189.3 req/s | 305.6 req/s | 1.61x |
+
+**Result.** The hypothesis was wrong, and the free option won.
+
+GPU decode is **7x slower in aggregate** than the CPU pool it was supposed to
+replace. `draft()` — a PIL feature already installed, one line of code — gives
+**1.62x end-to-end throughput while p99 latency *falls* 158.6 -> 122.2 ms**.
+
+**Explanation.** Both halves are about parallelism, not per-image speed.
+
+nvJPEG *is* faster per image than a single CPU thread: 8.08 ms against 13.75 ms.
+But there is one GPU and it is already the thing running inference, whereas
+there are sixteen decode threads. 16 x 72 img/s beats 1 x 116 img/s, and the GPU
+version additionally steals SMs from the forward pass it is meant to be feeding.
+A discrete card with a dedicated decode engine and idle SMs would score
+differently; this is a 20-SM, 60 W laptop chip.
+
+`draft()` wins for a different reason: it does not decode faster, it decodes
+**less**. A JPEG is stored as 8x8 DCT blocks, and libjpeg can run a *scaled*
+inverse DCT that emits 1/2, 1/4 or 1/8 size directly. Producing 387x304 instead
+of 1546x1213 and then resizing to 256 skips roughly 15/16 of the inverse
+transform and shrinks the resize too. The output is not identical to a full
+decode followed by a high-quality downscale, but both are box-averaging the same
+neighbourhoods, which is why 8/8 top-1 agreement holds.
+
+Falling p99 alongside rising throughput is the unusual part, and it follows: this
+is not a latency/throughput trade, it is the removal of work. Every request
+spends less time in the stage that was 90% of the system, so the queue in front
+of it is shorter for everyone.
+
+**Trade-off.** Four caveats, stated plainly.
+
+1. **The win is proportional to how oversized the input is, and is otherwise
+   exactly zero.** For the ~500x400 ImageNet samples no reduction keeps both
+   sides above 256, PIL declines, and the output is bit-identical (measured max
+   absolute difference 0.000, and pinned by a test). The 1.62x figure comes from
+   `data/dog.jpg` at 1546x1213. Real client uploads are phone photos, which is
+   the oversized case; a service fed pre-cropped thumbnails would gain nothing.
+2. **JPEG only.** PNG, BMP and WEBP have no scaled decode. No-op, also pinned by
+   a test.
+3. **Agreement was measured on 8 images.** That is a small sample. It is
+   agreement between two preprocessing paths, never accuracy — measuring
+   accuracy needs a labelled eval set this project does not have.
+4. **It defaults ON**, unlike `ALLOW_TF32`, and the distinction matters. TF32
+   silently degrades the FP32 *baseline* that every cross-runtime comparison in
+   this file is measured against, so it must be opted into. This changes the
+   input identically for every backend, so it cannot bias a comparison between
+   them. `FAST_DECODE=false` restores a bit-exact reference decode, and a test
+   asserts that path still matches torchvision.
+
+The GPU decode implementation was thrown away rather than kept behind a flag.
+A rejected optimisation that stays in the serving path is a maintenance cost
+with a measured negative return.
+
+---
+
 ## Pending
 
-Nothing. All 19 experiments are recorded above.
+Nothing. All 21 experiments are recorded above.
 
